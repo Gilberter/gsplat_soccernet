@@ -162,7 +162,10 @@ class DefaultStrategy(Strategy):
         assert (
             self.key_for_gradient in info
         ), "The 2D means of the Gaussians is required but missing."
-        info[self.key_for_gradient].retain_grad()
+        print(info[self.key_for_gradient].requires_grad)  # should be True
+
+        if step < self.refine_stop_iter:
+            info[self.key_for_gradient].retain_grad()
 
     def step_post_backward(
         self,
@@ -236,7 +239,11 @@ class DefaultStrategy(Strategy):
         if self.absgrad:
             grads = info[self.key_for_gradient].absgrad.clone()
         else:
-            grads = info[self.key_for_gradient].grad.clone()
+            grad = info[self.key_for_gradient].grad
+            if grad is None:
+                grads = torch.zeros_like(info[self.key_for_gradient])
+            else:
+                grads = grad.clone()
         grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
         grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
 

@@ -125,3 +125,9 @@ data
 results
 
 !examples/benchmarks/compression/results/
+
+
+.github
+assets
+docs
+profiling

@@ -344,21 +344,24 @@ def _isect_tiles(
         This is a minimal implementation of the fully fused version, which has more
         arguments. Not all arguments are supported.
     """
-    image_dims = means2d.shape[:-2]
+    image_dims = means2d.shape[:-2] # Batch and C Images
     N = means2d.shape[-2]
     assert means2d.shape == image_dims + (N, 2), means2d.shape
     assert radii.shape == image_dims + (N, 2), radii.shape
     assert depths.shape == image_dims + (N,), depths.shape
 
     device = means2d.device
-    I = math.prod(image_dims)
-    means2d = means2d.reshape(I, N, 2)
-    radii = radii.reshape(I, N, 2)
+    I = math.prod(image_dims) # Batch x C = All images
+    means2d = means2d.reshape(I, N, 2) # Images, N , 2
+    radii = radii.reshape(I, N, 2) # 
     depths = depths.reshape(I, N)
 
     # compute tiles_per_gauss
     tile_means2d = means2d / tile_size
     tile_radii = radii / tile_size
+
+    # tile_means2d center of the gaussian in title space
+    # 
     tile_mins = torch.floor(tile_means2d - tile_radii).int()
     tile_maxs = torch.ceil(tile_means2d + tile_radii).int()
     tile_mins[..., 0] = torch.clamp(tile_mins[..., 0], 0, tile_width)
@@ -381,11 +384,13 @@ def _isect_tiles(
     assert image_n_bits + tile_n_bits + 32 <= 64
 
     def binary(num):
+        # for a number of num
         return "".join("{:0>8b}".format(c) for c in struct.pack("!f", num))
 
     def kernel(image_id, gauss_id):
         if radii[image_id, gauss_id, 0] <= 0.0 or radii[image_id, gauss_id, 1] <= 0.0:
             return
+        
         index = image_id * N + gauss_id
         curr_idx = cum_tiles_per_gauss[index - 1] if index > 0 else 0
 

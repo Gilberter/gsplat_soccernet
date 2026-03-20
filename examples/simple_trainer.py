@@ -71,6 +71,11 @@ class Config:
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
+
+    # Colmap dir
+    colmap_dir: str = ""
+
+
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
@@ -215,6 +220,12 @@ class Config:
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
     with_eval3d: bool = False
+
+    # 
+    rasterize_mode: Optional[Literal["classic", "antialiased"]] = None
+
+    absgrad: bool = False
+
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -371,6 +382,7 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
             load_exposure=cfg.load_exposure,
+            colmap_dir=cfg.colmap_dir
         )
         self.trainset = Dataset(
             self.parser,
@@ -625,13 +637,15 @@ class Runner:
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
-            rasterize_mode=rasterize_mode,
+            rasterize_mode=cfg.rasterize_mode,
             distributed=self.world_size > 1,
             camera_model=self.cfg.camera_model,
             with_ut=self.cfg.with_ut,
             with_eval3d=self.cfg.with_eval3d,
             **kwargs,
         )
+        if "means2d" in info and not info["means2d"].requires_grad:
+            info["means2d"] = info["means2d"] + 0.0 * means[..., None, :, :2].expand_as(info["means2d"])
         if masks is not None:
             render_colors[~masks] = 0
 
@@ -1039,8 +1053,9 @@ class Runner:
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
-                self.eval(step)
-                self.render_traj(step)
+                #self.eval(step)
+                #self.render_traj(step)
+                pass
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:

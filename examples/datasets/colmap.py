@@ -80,16 +80,16 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         load_exposure: bool = False,
+        colmap_dir: str = ""
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
         self.load_exposure = load_exposure
+        self.colmap_dir = colmap_dir
 
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
-        if not os.path.exists(colmap_dir):
-            colmap_dir = os.path.join(data_dir, "sparse")
+        
         assert os.path.exists(
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
@@ -415,7 +415,10 @@ class Dataset:
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
+        if self.parser.test_every == 0:
+            print(f"All Training")
+            self.indices = indices
+        elif split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
