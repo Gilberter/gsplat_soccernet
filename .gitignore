@@ -133,5 +133,5 @@ tests
 *docs
 profiling
 cuda
-clang-format
-clangd_template
+.clang-format
+.clangd_template

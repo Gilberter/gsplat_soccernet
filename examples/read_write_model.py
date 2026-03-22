@@ -139,7 +139,6 @@ def read_cameras_binary(path_to_model_file):
                 fid, num_bytes=24, format_char_sequence="iiQQ")
             camera_id = camera_properties[0]
             model_id = camera_properties[1]
-            print(f"Camera ID: {camera_id}, Model ID: {model_id}")
             model_name = CAMERA_MODEL_IDS[camera_properties[1]].model_name
             width = camera_properties[2]
             height = camera_properties[3]
