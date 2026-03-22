@@ -131,7 +131,5 @@ results
 assets
 tests
 *docs
-profiling
-cuda
 .clang-format
 .clangd_template
