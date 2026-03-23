@@ -409,11 +409,26 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_ground_masks: str = ""
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.load_ground_masks = load_ground_masks
+
+        
+        # Validate the mask directory exists and index available files
+        self.ground_mask_files = {}
+        if self.load_ground_masks != "":
+            assert os.path.exists(load_ground_masks), \
+                f"Ground mask directory {load_ground_masks} does not exist."
+            for fname in os.listdir(load_ground_masks):
+                # key by stem so "frame_001.png" matches "frame_001.jpg" image names
+                stem = os.path.splitext(fname)[0]
+                self.ground_mask_files[stem] = os.path.join(load_ground_masks, fname)
+
+
         indices = np.arange(len(self.parser.image_names))
         if self.parser.test_every == 0:
             print(f"All Training")
@@ -494,6 +509,35 @@ class Dataset:
             data["points"] = torch.from_numpy(points).float()
             data["depths"] = torch.from_numpy(depths).float()
 
+        if self.load_ground_masks != "":
+            image_name = self.parser.image_names[index]
+            stem = os.path.splitext(image_name)[0]
+
+            if stem in self.ground_mask_files:
+                ground_mask = imageio.imread(self.ground_mask_files[stem])
+
+                # Apply same undistortion as the image
+                if len(params) > 0:
+                    mapx, mapy = (
+                        self.parser.mapx_dict[camera_id],
+                        self.parser.mapy_dict[camera_id],
+                    )
+                    ground_mask = cv2.remap(
+                        ground_mask, mapx, mapy, cv2.INTER_NEAREST  # no interpolation for masks
+                    )
+                    x, y, w, h = self.parser.roi_undist_dict[camera_id]
+                    ground_mask = ground_mask[y : y + h, x : x + w]
+                if self.patch_size is not None:
+                    ground_mask = ground_mask[y : y + self.patch_size, x : x + self.patch_size]
+
+                ground_mask = torch.from_numpy(ground_mask > 0).bool()  # [H, W]
+        
+            else:
+                # No mask found for this image — return all-False mask
+                h, w = image.shape[:2]
+                ground_mask = torch.zeros(h, w, dtype=torch.bool)
+
+            data["ground_mask"] = ground_mask  # [H, W] bool
         return data
 
 

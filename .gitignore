@@ -126,10 +126,3 @@ results
 
 !examples/benchmarks/compression/results/
 
-.github
-
-assets
-tests
-*docs
-.clang-format
-.clangd_template
