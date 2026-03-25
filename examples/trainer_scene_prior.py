@@ -801,7 +801,7 @@ class Runner:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
-            if cfg.ground_depth_loss:
+            if cfg.ground_depth_loss: # Added ground masks
                 ground_masks = data["ground_mask"].to(device)  # [1, H, W] bool
                 
 
@@ -883,7 +883,7 @@ class Runner:
 
 
             if cfg.ground_depth_loss:
-                from ground_plane import ground_plane_depth_guided, depth_supervision_loss
+                from ground_plane_guided import ground_plane_depth_guided, depth_supervision_loss, quat_scale_to_covar
 
                 # Build D_gt — sparse depth map from ground plane geometry
                 _, _, _, _, D_gt, _ = ground_plane_depth_guided(

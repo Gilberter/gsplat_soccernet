@@ -493,12 +493,27 @@ def ground_plane_depth_guided(
         # Stack into [..., 1, M, 2]  for cam2world_ground
         rays = torch.stack([Xc, Yc], dim=-1)[None, None, :, :]  # [1, 1, M, 2]
 
-        # Intersect rays with Zw = 0  (eq. 7)
-        Xw_pts = cam2world_ground(rays, vm_c)    # [1, 1, M, 2]
-        depth_pts = calculate_depth(Xw_pts, vm_c)  # [1, 1, M]
+                # Intersect rays with Zw = 0  (eq. 7)
+        Xw_pts    = cam2world_ground(rays, vm_c)      # [1, 1, M, 2]
+        depth_pts = calculate_depth(Xw_pts, vm_c)     # [1, 1, M]
+        depth_vals = depth_pts.squeeze([0, 1])         # [M]
 
-        # Write depths into the output map at the masked pixel positions
-        D_gt[..., c, ys, xs] = depth_pts.squeeze([0, 1])  # [M]
+        # Filter 1: depth must be in valid range
+        valid_depth = (depth_vals > near_plane) & (depth_vals < far_plane)
+
+        # Filter 2: pixel coords must be inside the image
+        # ys and xs come from torch.where(mask_c) so they are already
+        # in-bounds for mask_c, but degenerate geometry can produce
+        # world points that back-project to coordinates outside [0,H) [0,W)
+        valid_bounds = (
+            (ys >= 0) & (ys < height) &
+            (xs >= 0) & (xs < width)
+        )
+
+        valid_pts = valid_depth & valid_bounds
+
+        if valid_pts.any():
+            D_gt[..., c, ys[valid_pts], xs[valid_pts]] = depth_vals[valid_pts]
 
     return means2d, conics, depths_zc, radii_out.int(), D_gt, valid
 

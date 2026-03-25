@@ -215,6 +215,8 @@ class Parser:
             )
             image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
+    
+      
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
@@ -427,7 +429,7 @@ class Dataset:
                 # key by stem so "frame_001.png" matches "frame_001.jpg" image names
                 stem = os.path.splitext(fname)[0]
                 self.ground_mask_files[stem] = os.path.join(load_ground_masks, fname)
-
+        print(f"Ground Mask Files {len(self.ground_mask_files)}")
 
         indices = np.arange(len(self.parser.image_names))
         if self.parser.test_every == 0:
@@ -487,32 +489,39 @@ class Dataset:
             data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
 
         if self.load_depths:
-            # projected points to image plane to get depths
             worldtocams = np.linalg.inv(camtoworlds)
             image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
-            )
-            points = points[selector]
-            depths = depths[selector]
-            data["points"] = torch.from_numpy(points).float()
-            data["depths"] = torch.from_numpy(depths).float()
+            
+            # Some images have no triangulated points — skip gracefully
+            if image_name not in self.parser.point_indices:
+                data["points"] = torch.zeros((0, 2), dtype=torch.float32)
+                data["depths"] = torch.zeros((0,), dtype=torch.float32)
+            else:
+                point_indices = self.parser.point_indices[image_name]
+                points_world = self.parser.points[point_indices]
+                points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
+                points_proj = (K @ points_cam.T).T
+                points = points_proj[:, :2] / points_proj[:, 2:3]
+                depths = points_cam[:, 2]
+                selector = (
+                    (points[:, 0] >= 0)
+                    & (points[:, 0] < image.shape[1])
+                    & (points[:, 1] >= 0)
+                    & (points[:, 1] < image.shape[0])
+                    & (depths > 0)
+                )
+                points = points[selector]
+                depths = depths[selector]
+                data["points"] = torch.from_numpy(points).float()
+                data["depths"] = torch.from_numpy(depths).float()
 
         if self.load_ground_masks != "":
             image_name = self.parser.image_names[index]
             stem = os.path.splitext(image_name)[0]
-
+            if index == 0:
+                print(f"Image stem: '{stem}'")
+                print(f"First 5 mask stems: {list(self.ground_mask_files.keys())[:5]}")
+            
             if stem in self.ground_mask_files:
                 ground_mask = imageio.imread(self.ground_mask_files[stem])
 

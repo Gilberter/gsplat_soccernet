@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=sbatch_soccernet
-#SBATCH --output=./logs/colmap_rendering_%j.out
+#SBATCH --output=./logs/scene_prior%j.out
 #SBATCH --account=gs_hyperspectral
-#SBATCH --error=./logs/error_rendering_%j.log 
+#SBATCH --error=./logs/scene_prior%j.log 
 #SBATCH --cpus-per-task=10
 #SBATCH --partition=gpu 
 #SBATCH --mem=40G
@@ -31,6 +31,7 @@ print(torch.cuda.get_arch_list())
 # -------------------------
 # Arguments
 # -------------------------
+
 SCENE=$1
 VERSION=$2
 RASTER_MODE=${3:-0}      # 0 classic, 1 antialiased
@@ -40,8 +41,11 @@ WITH_UT=${6:-0}
 WITH_EVAL3D=${7:-0}
 ABSGRAD=${8:-0}
 DENSIFICATION=${9:-0}
-COLMAP_D=${10:-0}
-MAX_STEPS=${11:-30000}
+MASKS_DIR=$10
+GROUND_DEPTH_LOSS=$11
+DEPTH_LOSS=$12
+COLMAP_D=$13
+MAX_STEPS=${14:-30000}
 
 if [ "$RASTER_MODE" -eq 1 ]; then
     RASTERIZE_MODE="antialiased"
@@ -61,6 +65,8 @@ FLAGS=""
 [ "$WITH_UT"     -eq 1 ] && FLAGS="$FLAGS --with_ut"
 [ "$WITH_EVAL3D" -eq 1 ] && FLAGS="$FLAGS --with_eval3d"
 [ "$ABSGRAD"     -eq 1 ] && FLAGS="$FLAGS --absgrad"
+[ "$GROUND_DEPTH_LOSS"     -eq 1 ] && FLAGS="$FLAGS --ground_depth_loss"
+[ "$DEPTH_LOSS"     -eq 1 ] && FLAGS="$FLAGS --depth_loss"
 
 
 # -------------------------
@@ -90,7 +96,6 @@ echo "DATA_DIR:       $DATA_DIR"
 echo "RESULT_DIR:     $RESULT_DIR"
 echo "COLMAP_DIR:     $COLMAP_DIR"
 echo "CKPT:           $CKPT"
-echo "DENSIFICATION STRATEGY: $DENSIFICATION"
 echo "============================="
 
 # -------------------------
