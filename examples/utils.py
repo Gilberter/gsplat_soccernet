@@ -237,3 +237,18 @@ def apply_depth_colormap(
     if acc is not None:
         img = img * acc + (1.0 - acc)
     return img
+
+def quat_to_rotmat(quats: Tensor) -> Tensor:
+    """
+    Quaternion (w, x, y, z) → 3x3 rotation matrix.
+    Input: [..., 4]
+    Output: [..., 3, 3]
+    """
+    quats = F.normalize(quats, p=2, dim=-1)
+    w, x, y, z = torch.unbind(quats, dim=-1)
+    R = torch.stack([
+        1 - 2*(y**2 + z**2),  2*(x*y - w*z),      2*(x*z + w*y),
+        2*(x*y + w*z),         1 - 2*(x**2 + z**2), 2*(y*z - w*x),
+        2*(x*z - w*y),         2*(y*z + w*x),       1 - 2*(x**2 + y**2),
+    ], dim=-1)
+    return R.reshape(quats.shape[:-1] + (3, 3))

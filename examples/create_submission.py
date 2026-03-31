@@ -4,18 +4,18 @@ import argparse
 from pathlib import Path
 
 
-def create_submission_zip(base_dir, scenes, results_folder):
+def create_submission_zip(base_dir, scenes, results_folder, get_renders_dir):
     output_folder = os.path.join(f"{base_dir}/submissions",results_folder)
     os.makedirs(output_folder, exist_ok=True)
     zip_path = os.path.join(output_folder, "submission.zip")
     
-
+    
     
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
 
         for scene in scenes:
 
-            renders_dir = os.path.join(base_dir, scene, results_folder, "renders_ours")
+            renders_dir = os.path.join(base_dir, scene, results_folder, get_renders_dir)
 
             if not os.path.exists(renders_dir):
                 print(f"Skipping {scene}, {renders_dir} not found")
@@ -62,9 +62,16 @@ def main():
         help="Scene names"
     )
 
+    parser.add_argument(
+        "--get_renders_dir",
+        type=str,
+        default="renders_ours",
+        help="Scene names"
+    )
+
     args = parser.parse_args()
 
-    create_submission_zip(args.base_dir, args.scenes, args.results_folder)
+    create_submission_zip(args.base_dir, args.scenes, args.results_folder,args.get_renders_dir)
 
 
 if __name__ == "__main__":

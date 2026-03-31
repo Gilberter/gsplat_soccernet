@@ -374,9 +374,9 @@ def calculate_depth(
     """
     Compute Euclidean distance from camera centre to ground-plane point.
 
-    Paper Algorithm 1, line 11:  depth = ‖pw − t‖₂
+    Paper Algorithm 1, line 11:  depth = ‖pw - t‖₂
 
-    Camera centre in world space: c = −Rᵀ · t_cam
+    Camera centre in world space: c = -Rᵀ · t_cam
     (inverse of the extrinsic: t_cam maps world origin → camera space)
 
     Returns: [..., C, N]
@@ -431,10 +431,10 @@ def ground_plane_depth_guided(
     D_gt      : [..., C, H, W]   ground-plane depth map (0 = not ground)
     valid     : [..., C, N]      bool mask — Gaussians that passed near/far
     """
-    # ---- Step 1: world → camera ----
+    # Step 1: world to camera, 3D Gaussians to 2D
     means_c, covars_c = world_to_cam(means, covars, viewmats)
 
-    # ---- Step 2: perspective projection ----
+    # Step 2: perspective projection 
     means2d, cov2d, conics, depths_zc, radii = persp_proj(
         means_c, covars_c, Ks, width, height, eps2d
     )
@@ -478,6 +478,7 @@ def ground_plane_depth_guided(
         vm_c    = viewmats[..., c:c+1, :, :]    # [..., 1, 4, 4]
 
         # All masked pixel coordinates
+        # Only ground pixels
         ys, xs  = torch.where(mask_c[0] if mask_c.dim() > 2 else mask_c)
         if xs.numel() == 0:
             continue
@@ -492,19 +493,22 @@ def ground_plane_depth_guided(
 
         # Stack into [..., 1, M, 2]  for cam2world_ground
         rays = torch.stack([Xc, Yc], dim=-1)[None, None, :, :]  # [1, 1, M, 2]
+        
 
-                # Intersect rays with Zw = 0  (eq. 7)
+        # The most important
+        # Intersect rays with Zw = 0  (eq. 7)
         Xw_pts    = cam2world_ground(rays, vm_c)      # [1, 1, M, 2]
         depth_pts = calculate_depth(Xw_pts, vm_c)     # [1, 1, M]
         depth_vals = depth_pts.squeeze([0, 1])         # [M]
 
         # Filter 1: depth must be in valid range
         valid_depth = (depth_vals > near_plane) & (depth_vals < far_plane)
-
+        
         # Filter 2: pixel coords must be inside the image
         # ys and xs come from torch.where(mask_c) so they are already
         # in-bounds for mask_c, but degenerate geometry can produce
         # world points that back-project to coordinates outside [0,H) [0,W)
+        
         valid_bounds = (
             (ys >= 0) & (ys < height) &
             (xs >= 0) & (xs < width)
@@ -530,9 +534,9 @@ def depth_supervision_loss(
     height: int,
 ) -> Tensor:
     """
-    Partial depth supervision loss — paper eq. (13–14):
+    Partial depth supervision loss — paper eq. (13-14):
 
-        Ldist(r) = loss(D̂(r) − D(r))   if D(r) > 0
+        Ldist(r) = loss(D̂(r) - D(r))   if D(r) > 0
                    0                     if D(r) = 0
 
     Implementation: sample D_gt at each Gaussian's projected pixel centre,
@@ -632,8 +636,9 @@ def align_depth_scale(
     else:
         s = float(((sw * swxy - swx * swy) / denom).item())
         t = float(((swy - s * swx) / sw).item())
-
+    
     D_reg = s * D_pre + t
+    
     return s, t, D_reg
 
 
@@ -715,7 +720,8 @@ def render(
       loss (if target_image given)    — total training loss
     """
     C = viewmats.shape[0]
-    N = model.means.shape[0]
+    N = model.means.shape[0]    
+    
     tile_w = math.ceil(width  / tile_size)
     tile_h = math.ceil(height / tile_size)
 
@@ -758,7 +764,7 @@ def render(
             lambda_dist=lambda_dist,
         )
         out.update(loss=L, Lcolor=Lcolor, Ldist=Ldist)
-
+        
     return out
 
 
@@ -813,7 +819,7 @@ def train(
                 f"Lcolor={out['Lcolor'].item():.4f}  "
                 f"Ldist={out['Ldist'].item():.4f}"
             )
-
+    
     return model
 
 

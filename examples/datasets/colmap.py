@@ -17,7 +17,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
+from torch.utils.data import Dataset 
 import cv2
 import imageio.v2 as imageio
 import numpy as np
@@ -413,6 +413,7 @@ class Dataset:
         load_depths: bool = False,
         load_ground_masks: str = ""
     ):
+        super().__init__()
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
@@ -521,29 +522,27 @@ class Dataset:
             if index == 0:
                 print(f"Image stem: '{stem}'")
                 print(f"First 5 mask stems: {list(self.ground_mask_files.keys())[:5]}")
-            
+                print(f"Dir Masks: {self.load_ground_masks}")
             if stem in self.ground_mask_files:
                 ground_mask = imageio.imread(self.ground_mask_files[stem])
+                h,w = ground_mask.shape[:2]
+                new_h = h // self.parser.factor
+                new_w = w // self.parser.factor
 
-                # Apply same undistortion as the image
-                if len(params) > 0:
-                    mapx, mapy = (
-                        self.parser.mapx_dict[camera_id],
-                        self.parser.mapy_dict[camera_id],
-                    )
-                    ground_mask = cv2.remap(
-                        ground_mask, mapx, mapy, cv2.INTER_NEAREST  # no interpolation for masks
-                    )
-                    x, y, w, h = self.parser.roi_undist_dict[camera_id]
-                    ground_mask = ground_mask[y : y + h, x : x + w]
-                if self.patch_size is not None:
-                    ground_mask = ground_mask[y : y + self.patch_size, x : x + self.patch_size]
-
+                ground_mask = cv2.resize(
+                    ground_mask,
+                    (new_w, new_h),
+                    interpolation=cv2.INTER_NEAREST  # IMPORTANT for masks
+                )
                 ground_mask = torch.from_numpy(ground_mask > 0).bool()  # [H, W]
+
         
             else:
                 # No mask found for this image — return all-False mask
                 h, w = image.shape[:2]
+                if self.parser.factor > 1:
+                    h = h // self.parser.factor
+                    w = w // self.parser.factor
                 ground_mask = torch.zeros(h, w, dtype=torch.bool)
 
             data["ground_mask"] = ground_mask  # [H, W] bool
