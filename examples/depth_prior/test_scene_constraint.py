@@ -133,6 +133,15 @@ try:
     ok("ground_mask present",  sh(data["ground_mask"])) if has_mask else fail("ground_mask missing — check ground_seg_dir")
     ok("colmap depth points",  f"M'={data['points'].shape[1]}") if has_pts else fail("points/depths missing")
 
+    print(f"Check Depth Map From DA3")
+    depth_da3 = data["mini_depth"].cpu().numpy()
+
+    save_debug_image("./logs/rgb_rendered.png", depth_da3)
+
+    print(f"Checking the confidence map from DA3")
+    confidence_da3 = data["mini_confidence"].cpu().numpy()
+    save_debug_image("./logs/confidence_rendered.png", confidence_da3)
+
     if has_mask:
         n_ground = data["ground_mask"].sum().item()
         ok("ground_mask has True pixels", f"{int(n_ground)} pixels") \

@@ -56,7 +56,7 @@ from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-
+from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss 
 
 @dataclass
 class Config:
@@ -226,6 +226,7 @@ class Config:
     ground_depth_loss: bool = False
     ground_depth_lambda: float = 2.3
     ground_seg_dir: str = ""
+    ground_depth_start_step: int = 1000
     
     rasterize_mode: Optional[Literal["classic", "antialiased"]] = None
 
@@ -396,6 +397,7 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss, # Load Ground Truth Depths from COLMAP
             load_ground_masks=cfg.ground_seg_dir, # SAM Ground Segmentation Directory
+            load_mini_npz=cfg.mini_depth_dir # Load Depth and Confidence Maps from DA3
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -800,6 +802,8 @@ class Runner:
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+                depth_prior = data["mini_depth"].to(device)  # [1, H, W]
+                cofidence_depth_map = data["mini_confidence"].to(device)  # [1, H, W]
 
             if cfg.ground_depth_loss: # Added ground masks
                 ground_masks = data["ground_mask"].to(device)  # [1, H, W] bool
@@ -860,67 +864,49 @@ class Runner:
 
                 
             if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                # depth loss update it
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                # LOAD DEPTH MAP [H,W] from DA3 Model
+                depth_map = data["mini_depth"].to(device)  # [H, W]
+                # Where depths_image is the rendered depth map from gaussian splatting in rasterization
+
+                depthloss = F.l1_loss(depths_image, depth_map) * self.scene_scale
+                loss = loss + depthloss * cfg.depth_lambda
                 loss += depthloss * cfg.depth_lambda
 
 
 
-            if cfg.ground_depth_loss:
-                from ground_plane_guided import ground_plane_depth_guided, depth_supervision_loss, quat_scale_to_covar
+            if cfg.ground_depth_loss and ground_masks is not None and step >= cfg.ground_depth_start_step:
+                
+                viewmats_c = torch.linalg.inv(camtoworlds)    # [1, 4, 4]
 
-                # Build D_gt — sparse depth map from ground plane geometry
-                _, _, _, _, D_gt, _ = ground_plane_depth_guided(
-                    means      = self.splats["means"],
-                    covars     = quat_scale_to_covar(
-                                     F.normalize(self.splats["quats"], dim=-1),
-                                     torch.exp(self.splats["scales"]),
-                                 ),
-                    viewmats   = torch.linalg.inv(camtoworlds),  # world→cam [1,4,4]
-                    Ks         = Ks,                              # [1, 3, 3]
-                    masks      = ground_masks.unsqueeze(0),       # [1, 1, H, W]
+                D_gt = build_ground_depth_map(
+                    viewmats   = viewmats_c[0],               # [1, 4, 4] → [C, 4, 4]  C=1
+                    Ks         = Ks[0].unsqueeze(0),          # [1, 3, 3]
+                    masks      = ground_masks,                # [1, H, W]
                     width      = width,
                     height     = height,
                     near_plane = cfg.near_plane,
                     far_plane  = cfg.far_plane,
+                )                                             # [1, H, W]
+
+                da3 = data["mini_depth"].to(device).unsqueeze(0) if "mini_depth" in data else None
+
+                gnd_loss, gnd_info = ground_supervision_loss(
+                    depths_image       = depths_image,        # [1, H, W, 1]
+                    render_normals     = None,                # set from 2DGS outputs if using 2DGS
+                    normals_from_depth = None,
+                    alpha_map          = alphas,
+                    da3_depth          = da3,
+                    D_gt               = D_gt,
+                    ground_mask        = ground_masks,        # [1, H, W]
+                    scene_scale        = self.scene_scale,
+                    lambda_da3         = 1.0,
+                    lambda_ground      = cfg.ground_depth_lambda,  # 2.3
+                    lambda_normal      = 0.05,                # only active when use_2dgs=True
+                    use_2dgs           = False,               # flip to True with simple_trainer_2dgs
                 )
 
-                # D_pred: sample rendered depth image at each Gaussian's 2D position
-                # info["means2d"] is [1, N, 2] — gradient kept alive by rasterize_splats
-                means2d = info["means2d"]                              # [1, N, 2]
-                norm_x  = (means2d[..., 0] / (width  - 1)) * 2 - 1
-                norm_y  = (means2d[..., 1] / (height - 1)) * 2 - 1
-                grid_gd = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(2)  # [1,N,1,2]
-                D_pred  = F.grid_sample(
-                    depths_image.permute(0, 3, 1, 2),   # [1, 1, H, W]
-                    grid_gd, align_corners=True,
-                    mode="bilinear", padding_mode="zeros",
-                ).squeeze(1).squeeze(-1)            # [1, N]
-
-                ground_loss = depth_supervision_loss(
-                    D_pred  = D_pred,
-                    D_gt    = D_gt,
-                    means2d = means2d,
-                    width   = width,
-                    height  = height,
-                )
-                loss += ground_loss * cfg.ground_depth_lambda
+                if torch.isfinite(gnd_loss):
+                    loss = loss + gnd_loss
 
 
             if cfg.post_processing == "bilateral_grid":

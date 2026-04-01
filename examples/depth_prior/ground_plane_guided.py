@@ -1,629 +1,584 @@
 """
-Scene-Constrained Gaussian Splatting
-=====================================
-Full PyTorch implementation combining:
-  - 3D Gaussian Splatting (Kerbl et al. 2023)  — forward rendering pipeline
-  - Scene-Constrained NeRF (Dai et al. 2024)   — ground-plane depth supervision
+ground_plane_losses.py
+======================
+Three-level depth supervision strategy for soccer field Gaussian Splatting.
 
-Pipeline overview
------------------
-1.  Quaternion + scale  →  3D covariance Σ          (_quat_scale_to_covar)
-2.  World → camera      →  means_c, covars_c         (_world_to_cam)
-3.  Camera → 2D         →  means2d, cov2d, conics    (_persp_proj + conic)
-4.  Depth from Zc       →  depths                    (from means_c[...,2])
-5.  Tile intersection   →  sorted (tile, depth) list (_isect_tiles)
-6.  Offset table        →  per-tile start indices    (_isect_offset_encode)
-7.  Ground depth prior  →  D_gt per masked pixel     (ground_plane_depth_guided)
-8.  Training loss       →  Lcolor + λ·Ldist          (total_loss)
+WHY THREE LEVELS:
+─────────────────
+  Level 1 — DA3 dense metric depth (direct image comparison)
+             Supervises EVERY pixel. Gradient flows through the full
+             alpha-blended rendered depth map.  Corrects the whole pitch.
+
+  Level 2 — Geometric ground-plane prior (Zw=0 plane intersection)
+             Supervises only SAM-masked GROUND pixels.  Pure geometry —
+             no learned component, no scale ambiguity.  Enforces the flat
+             Zw=0 constraint on floor Gaussians specifically.
+
+  Level 3 — 2DGS normal consistency (from simple_trainer_2dgs.py)
+             Forces floor disk normals to align with the depth gradient.
+             On a flat floor the depth gradient is zero → disks must point
+             straight up → they LIE IN the Zw=0 plane.
+             This is the mechanism that prevents green Gaussians drifting
+             in front of players.
+
+WHAT WAS WRONG WITH THE ORIGINAL depth_supervision_loss:
+─────────────────────────────────────────────────────────
+  The original function receives D_pred with shape [..., C, N] where N
+  is the number of Gaussians — NOT a pixel image.  It uses means2d to
+  sample D_gt at Gaussian centres and compares the per-Gaussian camera-
+  space z-depth (Zc) against the geometric prior sampled at the same pixel.
+
+  Problems:
+    1. Zc is the Gaussian's own camera-space z — it ignores all the
+       alpha-blending that the rasterizer does.  A Gaussian at Zc=5.0
+       may render to a pixel at depth 4.6 because closer Gaussians
+       partially occlude it.  The loss is comparing the wrong quantity.
+    2. It has no gradient signal for Gaussians that project to pixels
+       where D_gt=0 (non-ground pixels), even if those Gaussians float
+       above the floor.
+    3. The correct rendered depth — what we actually see — is in
+       depths_image [C, H, W, 1], the alpha-normalized expected depth
+       that comes out of rasterization with render_mode="RGB+ED".
+
+  The fix: compare depths_image directly against D_gt_map (same shape,
+  both [C, H, W]).  Gradient flows through the rasterizer's backward
+  pass and is correctly distributed over all contributing Gaussians.
+
+ALPHA-BLENDED DEPTH — WHY IT'S BETTER:
+────────────────────────────────────────
+  The 2DGS paper (eq. 18) defines:
+
+       z_mean = Σᵢ(ωᵢ · zᵢ) / (Σᵢ(ωᵢ) + ε)
+
+  where ωᵢ = Tᵢ · αᵢ · Ĝᵢ(u(x)) is the blending weight of the i-th
+  Gaussian at pixel x, and Tᵢ is the accumulated transmittance.
+
+  This is exactly what gsplat returns in the last channel of render_colors
+  when render_mode="RGB+ED" (Expected Depth).  The gradient of L1/MSE
+  on this quantity with respect to means flows back to every Gaussian
+  that has non-zero weight at any supervised pixel — correctly pulling
+  each floor Gaussian toward the right depth proportional to its weight.
+
+  The per-Gaussian Zc approach only moves one Gaussian at a time and
+  ignores the collective rendering.
+
+HOW THE GREEN-GAUSSIAN PROBLEM IS SOLVED:
+──────────────────────────────────────────
+  Green Gaussians appear in front of players because:
+    (a) The color loss sees green grass through transparent players.
+    (b) The optimizer places a green Gaussian at depth z_player to
+        explain the residual green tint — it's cheaper than making
+        the player Gaussian perfectly opaque.
+
+  The three-level depth supervision prevents this:
+    (a) Level 1 (DA3): the rendered depth at every player pixel must
+        match the DA3 depth of the player surface.  A green Gaussian
+        floating at player depth would make the rendered depth too
+        shallow — the L1 loss pulls it back to the correct depth.
+    (b) Level 2 (Zw=0 prior): only activates on SAM-masked ground pixels,
+        so it does not directly constrain player Gaussians.  But it
+        keeps floor Gaussians firmly at z_floor, which means the optimizer
+        cannot place a floor Gaussian above z_floor to explain a green
+        pixel at player depth.
+    (c) Level 3 (normal consistency): floor disks are forced flat.  A
+        disk lying in Zw=0 cannot have a component pointing toward the
+        camera, so it cannot "see" any player pixel.  Its colour signal
+        comes only from floor-facing pixels.
+
+USAGE:
+──────
+  In simple_trainer_guided.py replace the ground_loss block with:
+
+      from ground_plane_losses import (
+          depth_from_da3_loss,
+          ground_plane_prior_loss,
+          build_ground_depth_map,
+      )
+
+  See each function's docstring for the exact call signature and where
+  in the training loop to place it.
 """
 
 import math
-import struct
 from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 
 # =============================================================================
-# SECTION 1 — GEOMETRY HELPERS
+# LEVEL 1 — DA3 DENSE METRIC DEPTH
 # =============================================================================
 
-def quat_to_rotmat(quats: Tensor) -> Tensor:
-    """
-    Quaternion (w, x, y, z) → 3x3 rotation matrix.
-    Input: [..., 4]
-    Output: [..., 3, 3]
-    """
-    quats = F.normalize(quats, p=2, dim=-1)
-    w, x, y, z = torch.unbind(quats, dim=-1)
-    R = torch.stack([
-        1 - 2*(y**2 + z**2),  2*(x*y - w*z),      2*(x*z + w*y),
-        2*(x*y + w*z),         1 - 2*(x**2 + z**2), 2*(y*z - w*x),
-        2*(x*z - w*y),         2*(y*z + w*x),       1 - 2*(x**2 + y**2),
-    ], dim=-1)
-    return R.reshape(quats.shape[:-1] + (3, 3))
-
-
-def quat_scale_to_covar(
-    quats: Tensor,   # [..., 4]
-    scales: Tensor,  # [..., 3]
-    triu: bool = False,
+def depth_from_da3_loss(
+    depths_image: Tensor,     # [C, H, W, 1]  rendered expected depth (RGB+ED)
+    da3_depth:    Tensor,     # [C, H, W]     DA3 metric depth (already scale-aligned)
+    ground_mask:  Optional[Tensor] = None,  # [C, H, W] bool — if given, weight floor 2×
+    scene_scale:  float = 1.0,
+    floor_weight: float = 2.0,
 ) -> Tensor:
     """
-    Build 3D covariance  Σ = R · S · Sᵀ · Rᵀ  from quaternion and scale.
+    Direct pixel-space L1 loss between the rasterizer's alpha-blended
+    expected depth and the DA3 dense metric depth map.
 
-    Paper context: each Gaussian stores (q, s) instead of Σ directly to
-    guarantee positive-definiteness during optimisation.
+    WHY THIS IS BETTER THAN per-Gaussian Zc comparison:
+      - depths_image is the alpha-weighted rendered depth at each pixel.
+        It is what the camera actually "sees".
+      - Gradient flows through the full rasterizer backward pass, correctly
+        weighting each Gaussian by its contribution (blending weight) to
+        the pixel.  A Gaussian that barely contributes to a pixel gets a
+        small gradient; the dominant Gaussian gets a large one.
+      - L1 is more robust than MSE for depth — outliers from sky pixels
+        or DA3 failures are down-weighted relative to MSE.
 
-    triu=True returns the 6 upper-triangle elements [..., 6] instead of
-    the full [..., 3, 3] matrix.
+    WHERE TO CALL:
+      After rasterization, before loss.backward().
+      depths_image comes from renders[..., 3:4] when render_mode="RGB+ED".
+
+    SCALE ALIGNMENT:
+      da3_depth must be aligned to COLMAP metric scale before this call.
+      Use align_depth_scale() from ground_plane_guided.py, passing the
+      COLMAP sparse depth points as D_sparse.
+
+    Args:
+        depths_image : [C, H, W, 1]  — last channel of render_colors (RGB+ED)
+        da3_depth    : [C, H, W]     — DA3 metric depth, scale-aligned
+        ground_mask  : [C, H, W] bool — optional, upweights floor pixels
+        scene_scale  : overall scene scale from parser.scene_scale * 1.1
+        floor_weight : multiply loss at ground pixels by this factor (default 2×)
+
+    Returns:
+        Scalar loss tensor with gradient.
     """
-    R = quat_to_rotmat(quats)          # [..., 3, 3]
-    M = R * scales[..., None, :]       # [..., 3, 3]  =  R·diag(s)
-    covars = torch.einsum("...ij,...kj->...ik", M, M)  # [..., 3, 3]
-    if triu:
-        covars = covars.reshape(quats.shape[:-1] + (9,))
-        covars = (
-            covars[..., [0, 1, 2, 4, 5, 8]]
-            + covars[..., [0, 3, 6, 4, 7, 8]]
-        ) / 2.0  # [..., 6]
-    return covars
+    # depths_image: [C, H, W, 1] → [C, H, W]
+    d_pred = depths_image[..., 0]           # [C, H, W]
+    d_gt   = da3_depth.to(d_pred.device)    # [C, H, W]
+
+    # Only supervise where DA3 has valid (positive) depth
+    valid  = d_gt > 0.0                     # [C, H, W]
+    if not valid.any():
+        return torch.tensor(0.0, device=d_pred.device, requires_grad=True)
+
+    diff = (d_pred[valid] - d_gt[valid]).abs()
+
+    if ground_mask is not None:
+        # Build per-pixel weights: floor pixels get floor_weight, rest get 1.0
+        weights = torch.ones_like(d_pred)
+        weights[ground_mask & valid] = floor_weight
+        loss = (diff * weights[valid]).mean()
+    else:
+        loss = diff.mean()
+
+    return loss * scene_scale
 
 
 # =============================================================================
-# SECTION 2 — WORLD → CAMERA
+# LEVEL 2 — GEOMETRIC GROUND-PLANE PRIOR  (image-space version)
 # =============================================================================
 
-def world_to_cam(
-    means: Tensor,    # [..., N, 3]
-    covars: Tensor,   # [..., N, 3, 3]
-    viewmats: Tensor, # [..., C, 4, 4]
-) -> Tuple[Tensor, Tensor]:
-    """
-    Apply extrinsic transform E = [R | t] to Gaussian means and covariances.
-
-    Paper eq. (5):  Pc = Ti · Pw
-    where Ti = Pi · M unifies all cameras into the world frame (Zw=0 ground).
-
-    means_c  = R · means + t       [..., C, N, 3]
-    covars_c = R · Σ · Rᵀ          [..., C, N, 3, 3]
-    """
-    R = viewmats[..., :3, :3]   # [..., C, 3, 3]
-    t = viewmats[..., :3, 3]    # [..., C, 3]
-
-    means_c = (
-        torch.einsum("...cij,...nj->...cni", R, means)
-        + t[..., None, :]
-    )  # [..., C, N, 3]
-
-    covars_c = torch.einsum(
-        "...cij,...njk,...clk->...cnil", R, covars, R
-    )  # [..., C, N, 3, 3]
-
-    return means_c, covars_c
-
-
-# =============================================================================
-# SECTION 3 — CAMERA → 2D PROJECTION  (EWA splatting)
-# =============================================================================
-
-def persp_proj(
-    means: Tensor,   # [..., C, N, 3]
-    covars: Tensor,  # [..., C, N, 3, 3]
-    Ks: Tensor,      # [..., C, 3, 3]
-    width: int,
-    height: int,
-    eps2d: float = 0.3,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """
-    Project 3D Gaussians to 2D image plane using EWA splatting.
-
-    Returns
-    -------
-    means2d   : [..., C, N, 2]   pixel-space projected centers
-    cov2d     : [..., C, N, 2, 2] projected 2D covariance
-    conics    : [..., C, N, 3]   (a, b, c) = upper-tri of (Σ'2D)⁻¹
-    depths    : [..., C, N]      Zc — depth along optical axis
-    radii     : [..., C, N, 2]   pixel radius for tile intersection
-    """
-    tx, ty, tz = torch.unbind(means, dim=-1)
-    tz2 = tz ** 2
-
-    fx = Ks[..., 0, 0, None]  # [..., C, 1]
-    fy = Ks[..., 1, 1, None]
-    cx = Ks[..., 0, 2, None]
-    cy = Ks[..., 1, 2, None]
-
-    # Frustum clamping — prevents numerical explosion at image edges
-    tan_fovx = 0.5 * width  / fx
-    tan_fovy = 0.5 * height / fy
-    lim_x_pos = (width  - cx) / fx + 0.3 * tan_fovx
-    lim_x_neg =           cx  / fx + 0.3 * tan_fovx
-    lim_y_pos = (height - cy) / fy + 0.3 * tan_fovy
-    lim_y_neg =           cy  / fy + 0.3 * tan_fovy
-
-    tx = tz * torch.clamp(tx / tz, -lim_x_neg, lim_x_pos)
-    ty = tz * torch.clamp(ty / tz, -lim_y_neg, lim_y_pos)
-
-    # Jacobian of the perspective map (affine approximation around mean)
-    # J = [[fx/tz,  0,      -fx·tx/tz²],
-    #      [0,      fy/tz,  -fy·ty/tz²]]
-    O = torch.zeros_like(tz)
-    J = torch.stack(
-        [fx / tz, O, -fx * tx / tz2,
-         O, fy / tz, -fy * ty / tz2],
-        dim=-1,
-    ).reshape(means.shape[:-1] + (2, 3))  # [..., C, N, 2, 3]
-
-    # 2D covariance:  Σ'2D = J · Σ3D · Jᵀ
-    cov2d = torch.einsum("...ij,...jk,...kl->...il", J, covars, J.transpose(-1, -2))
-
-    # Add eps2d to diagonal for numerical stability (anti-aliasing compensation)
-    det_orig = cov2d[..., 0, 0] * cov2d[..., 1, 1] - cov2d[..., 0, 1] ** 2
-    cov2d = cov2d + torch.eye(2, device=means.device, dtype=means.dtype) * eps2d
-    det = (cov2d[..., 0, 0] * cov2d[..., 1, 1] - cov2d[..., 0, 1] ** 2).clamp(1e-10)
-
-    # Conic = (Σ'2D)⁻¹  stored as (a, b, c) for the quadratic form
-    # power = -½(a·Δx² + 2b·Δx·Δy + c·Δy²)
-    # a = Σ22/det,  b = -Σ12/det,  c = Σ11/det
-    conics = torch.stack([
-        cov2d[..., 1, 1] / det,
-        -(cov2d[..., 0, 1] + cov2d[..., 1, 0]) / 2.0 / det,
-        cov2d[..., 0, 0] / det,
-    ], dim=-1)  # [..., C, N, 3]
-
-    # 2D pixel-space centers:  u = fx·Xc/Zc + cx,  v = fy·Yc/Zc + cy
-    means2d = torch.einsum("...ij,...nj->...ni", Ks[..., :2, :3], means)
-    means2d = means2d / tz[..., None]  # [..., C, N, 2]
-
-    depths = tz  # [..., C, N]  — Zc, depth along optical axis
-
-    # Screen-space radius ≈ 3.33σ (covers ~99.9% of Gaussian mass)
-    radius_x = torch.ceil(3.33 * torch.sqrt(cov2d[..., 0, 0]))
-    radius_y = torch.ceil(3.33 * torch.sqrt(cov2d[..., 1, 1]))
-    radii = torch.stack([radius_x, radius_y], dim=-1)  # [..., C, N, 2]
-
-    return means2d, cov2d, conics, depths, radii
-
-
-# =============================================================================
-# SECTION 4 — TILE INTERSECTION + SORTING
-# =============================================================================
-
-@torch.no_grad()
-def isect_tiles(
-    means2d: Tensor,   # [..., N, 2]
-    radii: Tensor,     # [..., N, 2]
-    depths: Tensor,    # [..., N]
-    tile_size: int,
-    tile_width: int,
-    tile_height: int,
-    sort: bool = True,
-) -> Tuple[Tensor, Tensor, Tensor]:
-    """
-    For each (Gaussian, tile) intersection emit one record.
-    Records are sorted by (image_id | tile_id | depth) packed into int64.
-
-    IEEE-754 trick: positive float bit-patterns sort identically to
-    the float values, so a plain integer sort = front-to-back depth sort.
-
-    Returns
-    -------
-    tiles_per_gauss : [..., N]       how many tiles each Gaussian touches
-    isect_ids       : [n_isects]     packed 64-bit sort key
-    flatten_ids     : [n_isects]     which (image, gauss) index each entry is
-    """
-    image_dims = means2d.shape[:-2]
-    N = means2d.shape[-2]
-    I = math.prod(image_dims)
-    device = means2d.device
-
-    means2d = means2d.reshape(I, N, 2)
-    radii   = radii.reshape(I, N, 2)
-    depths  = depths.reshape(I, N)
-
-    tile_means2d = means2d / tile_size
-    tile_radii   = radii   / tile_size
-    tile_mins = torch.floor(tile_means2d - tile_radii).int()
-    tile_maxs = torch.ceil (tile_means2d + tile_radii).int()
-    tile_mins[..., 0] = tile_mins[..., 0].clamp(0, tile_width)
-    tile_mins[..., 1] = tile_mins[..., 1].clamp(0, tile_height)
-    tile_maxs[..., 0] = tile_maxs[..., 0].clamp(0, tile_width)
-    tile_maxs[..., 1] = tile_maxs[..., 1].clamp(0, tile_height)
-
-    tiles_per_gauss = (tile_maxs - tile_mins).prod(dim=-1)
-    tiles_per_gauss *= (radii > 0.0).all(dim=-1)
-
-    n_isects = int(tiles_per_gauss.sum().item())
-    isect_ids_lo = torch.empty(n_isects, dtype=torch.int32, device=device)
-    isect_ids_hi = torch.empty(n_isects, dtype=torch.int32, device=device)
-    flatten_ids  = torch.empty(n_isects, dtype=torch.int32, device=device)
-
-    cum_tiles = torch.cumsum(tiles_per_gauss.flatten(), dim=0)
-    image_n_bits = I.bit_length()
-    tile_n_bits  = (tile_width * tile_height).bit_length()
-    assert image_n_bits + tile_n_bits + 32 <= 64, \
-        "Too many images or tiles to pack into 64 bits"
-
-    def kernel(image_id: int, gauss_id: int):
-        if radii[image_id, gauss_id, 0] <= 0.0:
-            return
-        index    = image_id * N + gauss_id
-        curr_idx = int(cum_tiles[index - 1].item()) if index > 0 else 0
-
-        # Reinterpret float32 depth bits as int32 (preserves sort order)
-        depth_f32 = depths[image_id, gauss_id].item()
-        depth_id  = struct.unpack("i", struct.pack("f", depth_f32))[0]
-        depth_id  = int(depth_id) & 0xFFFFFFFF
-
-        t_min = tile_mins[image_id, gauss_id]
-        t_max = tile_maxs[image_id, gauss_id]
-        for y in range(int(t_min[1].item()), int(t_max[1].item())):
-            for x in range(int(t_min[0].item()), int(t_max[0].item())):
-                tile_id = y * tile_width + x
-                isect_ids_lo[curr_idx] = depth_id
-                isect_ids_hi[curr_idx] = (image_id << tile_n_bits) | tile_id
-                flatten_ids [curr_idx] = index
-                curr_idx += 1
-
-    for img in range(I):
-        for g in range(N):
-            kernel(img, g)
-
-    isect_ids = (
-        isect_ids_hi.to(torch.int64) << 32
-    ) | (isect_ids_lo.to(torch.int64) & 0xFFFFFFFF)
-
-    if sort:
-        isect_ids, sort_idx = torch.sort(isect_ids)
-        flatten_ids = flatten_ids[sort_idx]
-
-    tiles_per_gauss = tiles_per_gauss.reshape(image_dims + (N,)).int()
-    return tiles_per_gauss, isect_ids, flatten_ids
-
-
-@torch.no_grad()
-def isect_offset_encode(
-    isect_ids: Tensor,
-    I: int,
-    tile_width: int,
-    tile_height: int,
-) -> Tensor:
-    """
-    Convert sorted intersection list into a per-tile offset lookup table.
-
-    offsets[img, y, x] = index in isect_ids where tile (img, x, y) begins.
-    The renderer reads isect_ids[offset : offset + count] for each tile.
-    """
-    tile_n_bits = (tile_width * tile_height).bit_length()
-    tile_counts = torch.zeros(
-        (I, tile_height, tile_width), dtype=torch.int64, device=isect_ids.device
-    )
-
-    ids_uq, counts = torch.unique_consecutive(isect_ids >> 32, return_counts=True)
-    img_ids  = ids_uq >> tile_n_bits
-    tile_ids = ids_uq & ((1 << tile_n_bits) - 1)
-    tx = tile_ids % tile_width
-    ty = tile_ids // tile_width
-    tile_counts[img_ids, ty, tx] = counts
-
-    cum = torch.cumsum(tile_counts.flatten(), dim=0).reshape_as(tile_counts)
-    return (cum - tile_counts).int()
-
-
-# =============================================================================
-# SECTION 5 — GROUND-PLANE DEPTH  (Paper Algorithm 1)
-# =============================================================================
-
-def cam2world_ground(
-    means_2d: Tensor,  # [..., C, N, 2]  normalised camera rays (Xc/Zc, Yc/Zc)
-    viewmats: Tensor,  # [..., C, 4, 4]
-) -> Tensor:
-    """
-    Back-project camera-space rays onto the Zw = 0 ground plane.
-
-    Paper eq. (7): substitute Zw=0 into the world→camera mapping,
-    eliminate the unknown depth d, giving a 2x2 linear system in (Xw, Yw).
-
-    A · [Xw, Yw]ᵀ = b
-
-    where
-      A = [[Xc·r31 - r11,  Xc·r32 - r12],
-           [Yc·r31 - r21,  Yc·r32 - r22]]
-      b = [t1 - Xc·t3,
-           t2 - Yc·t3]
-
-    Returns: [..., C, N, 2]  — (Xw, Yw) world coordinates on the ground plane
-    """
-    x_c, y_c = torch.unbind(means_2d, dim=-1)  # [..., C, N]
-
-    R  = viewmats[..., :3, :3]   # [..., C, 3, 3]
-    t  = viewmats[..., :3, 3]    # [..., C, 3]
-
-    r11 = R[..., 0, 0]; r12 = R[..., 0, 1]
-    r21 = R[..., 1, 0]; r22 = R[..., 1, 1]
-    r31 = R[..., 2, 0]; r32 = R[..., 2, 1]
-    t1  = t[..., 0];    t2  = t[..., 1];  t3 = t[..., 2]
-
-    # Broadcast rotation scalars over N Gaussians
-    A11 = x_c * r31[..., None] - r11[..., None]
-    A12 = x_c * r32[..., None] - r12[..., None]
-    A21 = y_c * r31[..., None] - r21[..., None]
-    A22 = y_c * r32[..., None] - r22[..., None]
-
-    A = torch.stack([
-        torch.stack([A11, A12], dim=-1),
-        torch.stack([A21, A22], dim=-1),
-    ], dim=-2)  # [..., C, N, 2, 2]
-
-    b1 = t1[..., None] - x_c * t3[..., None]
-    b2 = t2[..., None] - y_c * t3[..., None]
-    b  = torch.stack([b1, b2], dim=-1)[..., None]  # [..., C, N, 2, 1]
-
-    Xw = torch.linalg.solve(A, b).squeeze(-1)  # [..., C, N, 2]
-    return Xw
-
-
-def calculate_depth(
-    Xw: Tensor,        # [..., C, N, 2]  (Xw, Yw) on Zw=0 plane
-    viewmats: Tensor,  # [..., C, 4, 4]
-) -> Tensor:
-    """
-    Compute Euclidean distance from camera centre to ground-plane point.
-
-    Paper Algorithm 1, line 11:  depth = ‖pw - t‖₂
-
-    Camera centre in world space: c = -Rᵀ · t_cam
-    (inverse of the extrinsic: t_cam maps world origin → camera space)
-
-    Returns: [..., C, N]
-    """
-    R      = viewmats[..., :3, :3]
-    t_cam  = viewmats[..., :3, 3]
-
-    # Camera centre: −Rᵀ t  (rotation is orthogonal so Rᵀ = R⁻¹)
-    cam_center = -torch.einsum("...ji,...j->...i", R, t_cam)  # [..., C, 3]
-    cam_center = cam_center[..., None, :]                      # [..., C, 1, 3]
-
-    # Lift (Xw, Yw) to 3D by appending Zw = 0
-    zeros  = torch.zeros_like(Xw[..., :1])
-    Xw_3d  = torch.cat([Xw, zeros], dim=-1)                   # [..., C, N, 3]
-
-    depth = torch.linalg.norm(cam_center - Xw_3d, dim=-1)     # [..., C, N]
-    return depth
-
-
-def ground_plane_depth_guided(
-    means: Tensor,     # [..., N, 3]    Gaussian world-space centres
-    covars: Tensor,    # [..., N, 3, 3] Gaussian world-space covariances
-    viewmats: Tensor,  # [..., C, 4, 4] extrinsic matrices (world → camera)
-    Ks: Tensor,        # [..., C, 3, 3] intrinsic matrices
-    masks: Tensor,     # [..., C, H, W] boolean, True = ground pixel
-    width: int,
-    height: int,
+def build_ground_depth_map(
+    viewmats:   Tensor,    # [C, 4, 4]  world-to-camera
+    Ks:         Tensor,    # [C, 3, 3]  intrinsics
+    masks:      Tensor,    # [C, H, W]  bool ground mask
+    width:      int,
+    height:     int,
     near_plane: float = 0.01,
     far_plane:  float = 1e10,
-    eps2d:      float = 0.3,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> Tensor:
     """
-    Full ground-plane depth prior pipeline from the paper.
+    Build D_gt as a full [C, H, W] depth image in pixel space.
 
-    Steps
-    -----
-    1. World → camera                         (_world_to_cam)
-    2. Project to 2D, get conics + radii      (persp_proj)
-    3. Validity filter (depth in [near, far]) 
-    4. For each camera, for each masked pixel:
-       a. Unproject pixel → camera-space ray   (pinhole eq. 8)
-       b. Intersect ray with Zw=0 plane        (cam2world_ground / eq. 7)
-       c. Compute Euclidean depth              (calculate_depth)
-    5. Return depth map D_gt for loss          (depth_supervision)
+    This replaces the per-Gaussian sampling approach.  The returned map
+    has the geometric ground-truth depth at every ground pixel and 0
+    everywhere else.  It can then be compared directly against
+    depths_image using ground_plane_prior_loss().
 
-    Returns
-    -------
-    means2d   : [..., C, N, 2]
-    conics    : [..., C, N, 3]
-    depths_zc : [..., C, N]      Zc (used for tile sorting)
-    radii     : [..., C, N, 2]
-    D_gt      : [..., C, H, W]   ground-plane depth map (0 = not ground)
-    valid     : [..., C, N]      bool mask — Gaussians that passed near/far
+    The math is unchanged from the original ground_plane_depth_guided():
+      1. For each masked pixel (u, v) shoot a ray (Xc, Yc) = ((u-cx)/fx, (v-cy)/fy)
+      2. Solve A·[Xw, Yw]ᵀ = b to find where the ray hits Zw=0  (eq. 7)
+      3. Depth = Euclidean distance from camera centre to that world point
+
+    Returns:
+        D_gt : [C, H, W]  float32,  0 where not ground
     """
-    # Step 1: world to camera, 3D Gaussians to 2D
-    means_c, covars_c = world_to_cam(means, covars, viewmats)
+    C  = viewmats.shape[0]
+    fx = Ks[:, 0, 0];  fy = Ks[:, 1, 1]
+    cx = Ks[:, 0, 2];  cy = Ks[:, 1, 2]
 
-    # Step 2: perspective projection 
-    means2d, cov2d, conics, depths_zc, radii = persp_proj(
-        means_c, covars_c, Ks, width, height, eps2d
-    )
+    D_gt = torch.zeros(C, height, width, device=viewmats.device, dtype=viewmats.dtype)
 
-    # ---- Step 3: validity filter ----
-    valid = (depths_zc > near_plane) & (depths_zc < far_plane)
-    radii_out = radii.clone()
-    radii_out[~valid] = 0
-
-    inside = (
-        (means2d[..., 0] + radii_out[..., 0] > 0)
-        & (means2d[..., 0] - radii_out[..., 0] < width)
-        & (means2d[..., 1] + radii_out[..., 1] > 0)
-        & (means2d[..., 1] - radii_out[..., 1] < height)
-    )
-    radii_out[~inside] = 0
-
-    # ---- Step 4: ground-plane depth map ----
-    # Extract camera intrinsics
-    fx = Ks[..., 0, 0]   # [..., C]
-    fy = Ks[..., 1, 1]
-    cx = Ks[..., 0, 2]
-    cy = Ks[..., 1, 2]
-
-    batch_dims = means.shape[:-2]
-    C = viewmats.shape[-3]
-
-    # Initialise output depth map with zeros
-    D_gt = torch.zeros(
-        batch_dims + (C, height, width),
-        device=means.device, dtype=means.dtype
-    )
-
-    # Iterate over cameras (typically C is small, e.g. 30–100)
     for c in range(C):
-        mask_c  = masks[..., c, :, :]           # [..., H, W]  bool
-        fx_c    = fx[..., c]                     # [...]
-        fy_c    = fy[..., c]
-        cx_c    = cx[..., c]
-        cy_c    = cy[..., c]
-        vm_c    = viewmats[..., c:c+1, :, :]    # [..., 1, 4, 4]
-
-        # All masked pixel coordinates
-        # Only ground pixels
-        ys, xs  = torch.where(mask_c[0] if mask_c.dim() > 2 else mask_c)
+        mask_c = masks[c] if masks.dim() == 3 else masks[0, c]   # [H, W]
+        ys, xs = torch.where(mask_c)
         if xs.numel() == 0:
             continue
 
-        xs_f = xs.float()
-        ys_f = ys.float()
+        # Pinhole un-projection  (paper eq. 8)
+        Xc = (xs.float() - cx[c]) / fx[c]   # [M]
+        Yc = (ys.float() - cy[c]) / fy[c]   # [M]
 
-        # Pinhole unprojection: (u,v) → normalised camera ray (Xc, Yc)
-        # This is eq. (8) in the paper
-        Xc = (xs_f - cx_c.squeeze()) / fx_c.squeeze()   # [M]
-        Yc = (ys_f - cy_c.squeeze()) / fy_c.squeeze()   # [M]
+        R  = viewmats[c, :3, :3]             # [3, 3]
+        t  = viewmats[c, :3, 3]              # [3]
 
-        # Stack into [..., 1, M, 2]  for cam2world_ground
-        rays = torch.stack([Xc, Yc], dim=-1)[None, None, :, :]  # [1, 1, M, 2]
-        
+        # 2×2 system:  A · [Xw, Yw]ᵀ = b   (derived by substituting Zw=0)
+        # A = [[Xc·r31 - r11,  Xc·r32 - r12],
+        #      [Yc·r31 - r21,  Yc·r32 - r22]]
+        # b = [t1 - Xc·t3,  t2 - Yc·t3]
+        A11 = Xc * R[2, 0] - R[0, 0]        # [M]
+        A12 = Xc * R[2, 1] - R[0, 1]        # [M]
+        A21 = Yc * R[2, 0] - R[1, 0]        # [M]
+        A22 = Yc * R[2, 1] - R[1, 1]        # [M]
 
-        # The most important
-        # Intersect rays with Zw = 0  (eq. 7)
-        Xw_pts    = cam2world_ground(rays, vm_c)      # [1, 1, M, 2]
-        depth_pts = calculate_depth(Xw_pts, vm_c)     # [1, 1, M]
-        depth_vals = depth_pts.squeeze([0, 1])         # [M]
+        b1  = t[0] - Xc * t[2]              # [M]
+        b2  = t[1] - Yc * t[2]              # [M]
 
-        # Filter 1: depth must be in valid range
-        valid_depth = (depth_vals > near_plane) & (depth_vals < far_plane)
-        
-        # Filter 2: pixel coords must be inside the image
-        # ys and xs come from torch.where(mask_c) so they are already
-        # in-bounds for mask_c, but degenerate geometry can produce
-        # world points that back-project to coordinates outside [0,H) [0,W)
-        
-        valid_bounds = (
-            (ys >= 0) & (ys < height) &
-            (xs >= 0) & (xs < width)
+        det = A11 * A22 - A12 * A21          # [M]
+
+        # Skip degenerate pixels (camera parallel to ground)
+        nonzero = det.abs() > 1e-8
+        if not nonzero.any():
+            continue
+
+        # Cramer's rule
+        Xw = torch.zeros_like(Xc)
+        Yw = torch.zeros_like(Yc)
+        Xw[nonzero] = (b1[nonzero] * A22[nonzero] - b2[nonzero] * A12[nonzero]) / det[nonzero]
+        Yw[nonzero] = (A11[nonzero] * b2[nonzero] - A21[nonzero] * b1[nonzero]) / det[nonzero]
+
+        # Camera centre in world coords:  c_world = -Rᵀ · t
+        cam_centre = -(R.T @ t)              # [3]
+
+        # Euclidean distance from camera centre to (Xw, Yw, 0)
+        dx    = Xw - cam_centre[0]
+        dy    = Yw - cam_centre[1]
+        dz    = -cam_centre[2]               # Zw = 0  →  dz = 0 - cam_centre[2]
+        depth = torch.sqrt(dx**2 + dy**2 + dz**2)   # [M]
+
+        valid = (
+            nonzero &
+            (depth > near_plane) &
+            (depth < far_plane)
         )
 
-        valid_pts = valid_depth & valid_bounds
+        if valid.any():
+            D_gt[c, ys[valid], xs[valid]] = depth[valid]
 
-        if valid_pts.any():
-            D_gt[..., c, ys[valid_pts], xs[valid_pts]] = depth_vals[valid_pts]
-
-    return means2d, conics, depths_zc, radii_out.int(), D_gt, valid
+    return D_gt   # [C, H, W]
 
 
-# =============================================================================
-# SECTION 6 — LOSSES
-# =============================================================================
-
-def depth_supervision_loss(
-    D_pred: Tensor,  # [..., C, N]   rendered depth from NeRF / GS
-    D_gt:   Tensor,  # [..., C, H, W] ground-truth from ground_plane_depth_guided
-    means2d: Tensor, # [..., C, N, 2] projected Gaussian centres
-    width: int,
-    height: int,
+def ground_plane_prior_loss(
+    depths_image: Tensor,    # [C, H, W, 1]  rendered expected depth
+    D_gt:         Tensor,    # [C, H, W]     from build_ground_depth_map()
+    loss_type:    str = "l1",   # "l1" | "mse" | "huber"
+    huber_delta:  float = 0.5,
 ) -> Tensor:
     """
-    Partial depth supervision loss — paper eq. (13-14):
+    Image-space ground-plane depth supervision.
 
-        Ldist(r) = loss(D̂(r) - D(r))   if D(r) > 0
-                   0                     if D(r) = 0
+    Compares the rendered depth image against the geometric Zw=0 depth
+    map at all ground pixels where D_gt > 0.
 
-    Implementation: sample D_gt at each Gaussian's projected pixel centre,
-    then compute MSE only where D_gt > 0.
+    WHY IMAGE-SPACE INSTEAD OF per-Gaussian:
+    ─────────────────────────────────────────
+    The old depth_supervision_loss samples D_gt at means2d positions and
+    compares against Zc (the Gaussian's own z-depth, not the blended pixel
+    depth).  This has two problems:
+
+      Problem A — Wrong quantity:
+        Zc is the Gaussian primitive's camera-space z.  The rendered depth
+        at a pixel is Σ(ωᵢ·Zc_i) / Σ(ωᵢ), a weighted average.  A single
+        Gaussian's Zc can be far from the pixel's rendered depth if other
+        Gaussians dominate.  Comparing Zc against D_gt[pixel] conflates
+        the primitive's position with the pixel's appearance.
+
+      Problem B — Sparse gradient:
+        The signal only reaches Gaussians whose means2d falls on a ground
+        pixel.  Gaussians that are slightly off the floor but whose splatted
+        footprint covers ground pixels get no signal.
+
+    The image-space comparison fixes both:
+      - depths_image IS the alpha-weighted rendered depth — the right quantity.
+      - Every pixel in the ground mask contributes a gradient.  The rasterizer
+        backward pass distributes it to every Gaussian with non-zero alpha at
+        that pixel, weighted by its contribution.
+
+    Args:
+        depths_image : [C, H, W, 1]  rendered depth (last channel of RGB+ED)
+        D_gt         : [C, H, W]     geometric ground-truth from build_ground_depth_map
+        loss_type    : "l1" (recommended), "mse", or "huber"
+        huber_delta  : threshold for huber loss (in metres)
+
+    Returns:
+        Scalar loss, or 0.0 with grad if no ground pixels are visible.
     """
-    # Sample D_gt at projected Gaussian positions
-    # Normalise pixel coords to [-1, 1] for grid_sample
-    norm_x = (means2d[..., 0] / (width  - 1)) * 2 - 1
-    norm_y = (means2d[..., 1] / (height - 1)) * 2 - 1
-    grid   = torch.stack([norm_x, norm_y], dim=-1)   # [..., C, N, 2]
+    d_pred = depths_image[..., 0]        # [C, H, W]
+    valid  = D_gt > 0.0                  # [C, H, W]
 
-    # D_gt: [..., C, H, W] → add channel dim → [..., C, 1, H, W]
-    D_gt_4d = D_gt.unsqueeze(-3)
-    # grid_sample expects [B, H, W, 2]; reshape accordingly
-    orig_shape = grid.shape[:-1]
-    B = math.prod(orig_shape[:-1])        # batch × C
-    N = orig_shape[-1]
-    D_gt_flat  = D_gt_4d.reshape(B, 1, height, width)
-    grid_flat  = grid.reshape(B, 1, N, 2)
+    if not valid.any():
+        return torch.tensor(0.0, device=depths_image.device, requires_grad=True)
 
-    D_sampled = F.grid_sample(
-        D_gt_flat, grid_flat,
-        mode='bilinear', padding_mode='zeros', align_corners=True
-    ).reshape(orig_shape)  # [..., C, N]
+    pred_v = d_pred[valid]
+    gt_v   = D_gt[valid]
 
-    # Mask: only supervise where ground depth is valid
-    valid_mask = D_sampled > 0.0
-
-    if not valid_mask.any():
-        return torch.tensor(0.0, device=D_pred.device, requires_grad=True)
-
-    loss = F.mse_loss(D_pred[valid_mask], D_sampled[valid_mask])
-    return loss
-
-
-def color_loss(rendered: Tensor, target: Tensor) -> Tensor:
-    """L2 colour reconstruction loss — eq. (11)."""
-    return F.mse_loss(rendered, target)
-
-
-def total_loss(
-    rendered:  Tensor,
-    target:    Tensor,
-    D_pred:    Tensor,
-    D_gt:      Tensor,
-    means2d:   Tensor,
-    width:     int,
-    height:    int,
-    lambda_dist: float = 2.3,  # paper sets λ = 2.3
-) -> Tuple[Tensor, Tensor, Tensor]:
-    """
-    Full training loss from paper eq. (14):
-
-        L = Lcolor + λ · Ldist
-    """
-    Lcolor = color_loss(rendered, target)
-    Ldist  = depth_supervision_loss(D_pred, D_gt, means2d, width, height)
-    L      = Lcolor + lambda_dist * Ldist
-    return L, Lcolor, Ldist
+    if loss_type == "l1":
+        return F.l1_loss(pred_v, gt_v)
+    elif loss_type == "mse":
+        return F.mse_loss(pred_v, gt_v)
+    elif loss_type == "huber":
+        return F.huber_loss(pred_v, gt_v, delta=huber_delta)
+    else:
+        raise ValueError(f"loss_type must be 'l1', 'mse', or 'huber', got {loss_type!r}")
 
 
 # =============================================================================
-# SECTION 7 — SCALE ALIGNMENT  (ZoeDepth comparison, eqs. 15–16)
+# LEVEL 3 — 2DGS NORMAL CONSISTENCY ADAPTED FOR FLOOR
 # =============================================================================
 
-def align_depth_scale(
-    D_pre:    Tensor,    # [...] estimated depth (ZoeDepth output)
-    D_sparse: Tensor,    # [...] sparse GT from point-cloud projection
-    weights:  Optional[Tensor] = None,  # [...] reliability weights w ∈ [0,1]
+def floor_normal_consistency_loss(
+    render_normals:    Tensor,   # [C, H, W, 3]  from rasterization_2dgs
+    normals_from_depth: Tensor,  # [C, H, W, 3]  depth-gradient normals
+    ground_mask:       Tensor,   # [C, H, W]  bool
+    world_up:          Tensor,   # [3]  world-space up vector (usually [0,0,1])
+    alpha_map:         Optional[Tensor] = None,  # [C, H, W, 1] accumulated alpha
+    world_up_weight:   float = 1.0,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Two-component normal regularisation for floor Gaussians.
+
+    Component A — Standard 2DGS normal consistency (eq. 14 of the paper):
+      Minimise 1 - nᵢᵀ·N at every ground pixel, where nᵢ is the splat
+      normal and N is the depth-gradient surface normal.  On a flat floor
+      both should point straight up.
+
+    Component B — World-up alignment at ground pixels:
+      Additionally penalise floor splat normals that deviate from the
+      world up vector.  This is a stronger constraint than Component A
+      alone because depth-gradient normals can be noisy at flat surfaces
+      (small depth differences → large relative noise in the gradient).
+
+    Together they force floor disks to lie flat in the Zw=0 plane:
+      - Component A: disk normal ≈ depth gradient normal
+      - Component B: disk normal ≈ world up vector
+      Both constraints converge to: disk normal = [0, 0, 1] (up)
+      which means the disk itself lies in the horizontal plane.
+
+    WHY THIS PREVENTS GREEN GAUSSIANS IN FRONT OF PLAYERS:
+      A 2D Gaussian disk with normal [0,0,1] is horizontal.  When the
+      rasterizer evaluates it for a player pixel, the ray-disk intersection
+      gives a large (u,v) offset from the disk centre, making the Gaussian
+      value exp(-(u²+v²)/2) very small.  The disk effectively has zero
+      weight at player pixels.  It cannot explain a green color there,
+      so the optimizer must assign that green to an actual floor Gaussian,
+      not a floating interloper at player depth.
+
+    Args:
+        render_normals     : [C, H, W, 3]  rendered splat normals (camera space)
+        normals_from_depth : [C, H, W, 3]  depth-gradient normals (camera space)
+        ground_mask        : [C, H, W]  True = ground pixel
+        world_up           : [3]  world-space up, transform to camera space inside
+        alpha_map          : [C, H, W, 1]  optional blending weight map
+        world_up_weight    : scale for Component B
+
+    Returns:
+        (loss_nc, loss_up) — normal consistency loss and world-up loss.
+        Add both to total loss.
+    """
+    if not ground_mask.any():
+        zero = torch.tensor(0.0, device=render_normals.device, requires_grad=True)
+        return zero, zero
+
+    # Mask to ground pixels
+    mask = ground_mask                         # [C, H, W]
+    n_render = render_normals[mask]            # [M, 3]
+    n_depth  = normals_from_depth[mask]        # [M, 3]
+
+    # Optional per-pixel alpha weighting
+    if alpha_map is not None:
+        w = alpha_map[..., 0][mask]            # [M]
+        w = w.detach()                         # don't differentiate through alpha
+    else:
+        w = torch.ones(n_render.shape[0], device=n_render.device)
+
+    # Component A — 2DGS normal consistency (paper eq. 14)
+    # 1 - dot(n_render, n_depth) in [0, 2]; 0 = perfectly aligned
+    dot_a  = (n_render * n_depth).sum(-1).clamp(-1, 1)   # [M]
+    loss_nc = (w * (1.0 - dot_a)).mean()
+
+    # Component B — World-up alignment
+    # Transform world_up to camera space (no translation needed for normals)
+    # world_up is [3]; we need it in the same space as render_normals
+    # render_normals from gsplat are already in world space after the transform
+    # in rasterization_2dgs:
+    #   render_normals = einsum("...ij,...hwj->...hwi", inv(viewmats)[:,:3,:3], normals_raw)
+    # so we compare directly in world space.
+    up = F.normalize(world_up.to(n_render.device), dim=0)  # [3]
+    dot_b   = (n_render * up.unsqueeze(0)).sum(-1)          # [M]
+    loss_up = (w * (1.0 - dot_b.clamp(-1, 1))).mean() * world_up_weight
+
+    return loss_nc, loss_up
+
+
+# =============================================================================
+# COMBINED LOSS — CONVENIENCE WRAPPER
+# =============================================================================
+
+def ground_supervision_loss(
+    # Rendered outputs
+    depths_image:       Tensor,              # [C, H, W, 1]  RGB+ED last channel
+    render_normals:     Optional[Tensor],    # [C, H, W, 3]  only for 2DGS
+    normals_from_depth: Optional[Tensor],   # [C, H, W, 3]  only for 2DGS
+    alpha_map:          Optional[Tensor],   # [C, H, W, 1]
+    # Ground prior inputs
+    da3_depth:          Optional[Tensor],   # [C, H, W]  scale-aligned DA3 depth
+    D_gt:               Optional[Tensor],   # [C, H, W]  from build_ground_depth_map()
+    ground_mask:        Tensor,             # [C, H, W]  bool SAM mask
+    # Config
+    scene_scale:        float = 1.0,
+    lambda_da3:         float = 1.0,        # weight for Level 1
+    lambda_ground:      float = 2.3,        # weight for Level 2  (paper value)
+    lambda_normal:      float = 0.05,       # weight for Level 3  (2DGS paper value)
+    lambda_world_up:    float = 0.05,       # weight for world-up component
+    world_up:           Optional[Tensor] = None,   # [3] default (0,0,1)
+    use_2dgs:           bool = False,       # True if training with 2DGS
+    loss_type:          str  = "l1",
+) -> Tuple[Tensor, dict]:
+    """
+    Combined three-level ground supervision.
+
+    Returns (total_ground_loss, breakdown_dict) where breakdown_dict
+    contains individual loss components for logging.
+
+    ★ USAGE IN TRAINING LOOP (replace the ground_loss block):
+
+        D_gt = build_ground_depth_map(
+            viewmats   = torch.linalg.inv(camtoworlds)[0],   # remove batch dim
+            Ks         = Ks[0],
+            masks      = ground_masks,   # [C, H, W]
+            width      = width,
+            height     = height,
+        ).unsqueeze(0)   # add C dim → [1, H, W] for C=1
+
+        # For 3DGS:
+        gnd_loss, gnd_info = ground_supervision_loss(
+            depths_image   = depths_image,          # [1, H, W, 1]
+            render_normals = None,
+            normals_from_depth = None,
+            alpha_map      = None,
+            da3_depth      = data["mini_depth"].to(device).unsqueeze(0),
+            D_gt           = D_gt,
+            ground_mask    = ground_masks,           # [1, H, W]
+            scene_scale    = self.scene_scale,
+        )
+
+        # For 2DGS (use renders from rasterization_2dgs):
+        gnd_loss, gnd_info = ground_supervision_loss(
+            depths_image       = render_colors[..., 3:4],
+            render_normals     = render_normals,
+            normals_from_depth = normals_from_depth,
+            alpha_map          = render_alphas,
+            da3_depth          = data["mini_depth"].to(device).unsqueeze(0),
+            D_gt               = D_gt,
+            ground_mask        = ground_masks,
+            scene_scale        = self.scene_scale,
+            use_2dgs           = True,
+        )
+
+        loss = loss + gnd_loss
+
+        # Logging:
+        for k, v in gnd_info.items():
+            writer.add_scalar(f"train/{k}", v, step)
+    """
+    total = torch.tensor(0.0, device=depths_image.device, requires_grad=False)
+    info  = {}
+
+    # ── Level 1: DA3 dense depth ─────────────────────────────────────────────
+    if da3_depth is not None and lambda_da3 > 0:
+        l1 = depth_from_da3_loss(
+            depths_image = depths_image,
+            da3_depth    = da3_depth,
+            ground_mask  = ground_mask,
+            scene_scale  = scene_scale,
+        )
+        total = total + l1 * lambda_da3
+        info["loss_da3_depth"] = l1.item()
+
+    # ── Level 2: Geometric ground-plane prior ────────────────────────────────
+    if D_gt is not None and lambda_ground > 0:
+        l2 = ground_plane_prior_loss(
+            depths_image = depths_image,
+            D_gt         = D_gt,
+            loss_type    = loss_type,
+        )
+        total = total + l2 * lambda_ground
+        info["loss_ground_prior"] = l2.item()
+
+    # ── Level 3: Normal consistency (2DGS only) ──────────────────────────────
+    if use_2dgs and render_normals is not None and normals_from_depth is not None:
+        if world_up is None:
+            world_up = torch.tensor([0.0, 0.0, 1.0], device=depths_image.device)
+
+        l3_nc, l3_up = floor_normal_consistency_loss(
+            render_normals     = render_normals,
+            normals_from_depth = normals_from_depth,
+            ground_mask        = ground_mask,
+            world_up           = world_up,
+            alpha_map          = alpha_map,
+            world_up_weight    = lambda_world_up / lambda_normal if lambda_normal > 0 else 1.0,
+        )
+        total = total + l3_nc * lambda_normal + l3_up * lambda_world_up
+        info["loss_normal_consistency"] = l3_nc.item()
+        info["loss_world_up"]           = l3_up.item()
+
+    info["loss_ground_total"] = total.item()
+    return total, info
+
+
+# =============================================================================
+# SCALE ALIGNMENT — connect DA3 to COLMAP metric
+# =============================================================================
+
+def align_da3_to_colmap(
+    da3_depth:    Tensor,    # [H, W]  raw DA3 output
+    colmap_points: Tensor,   # [M, 2]  pixel coords (u, v)
+    colmap_depths: Tensor,   # [M]     sparse COLMAP depths in metres
 ) -> Tuple[float, float, Tensor]:
     """
-    Find scale s and shift t such that  s·D_pre + t ≈ D_sparse
-    using weighted least-squares (paper eqs. 15–16).
+    Find scale s and shift t so that  s · da3_depth + t ≈ colmap_depths.
 
-    Only uses pixels where D_sparse > 0 (i.e. where the sparse cloud projects).
+    Uses weighted least-squares (paper eqs. 15-16) on the sparse COLMAP
+    depth points projected into the image.
 
-    Returns: (s, t, D_reg) where D_reg = s·D_pre + t
+    Returns:
+        (s, t, aligned_depth)  where aligned_depth has the same shape as da3_depth.
+
+    USAGE:
+        # In the dataloader or pre-processing step (not per iteration):
+        s, t, da3_aligned = align_da3_to_colmap(
+            da3_depth     = prediction.depth[image_idx],   # [H, W]
+            colmap_points = data["points"][0],              # [M, 2]
+            colmap_depths = data["depths"][0],              # [M]
+        )
+        # Store da3_aligned in the dataset so it's loaded as data["mini_depth"]
+
+    WHY NOT PER-ITERATION:
+        Scale alignment is a least-squares solve over sparse points.  It
+        is cheap (<<1ms) but the result changes every time points change.
+        Doing it once per image in a preprocessing pass is cleaner.
+        If you want online alignment (adapts as camera poses refine during
+        pose_opt), call this each iteration — it is differentiable-free.
     """
-    valid = D_sparse > 0
-    x = D_pre[valid].float()
-    y = D_sparse[valid].float()
-    w = weights[valid].float() if weights is not None else torch.ones_like(x)
+    H, W = da3_depth.shape
+    # Sample DA3 at COLMAP point locations
+    u = colmap_points[:, 0].long().clamp(0, W - 1)
+    v = colmap_points[:, 1].long().clamp(0, H - 1)
 
-    # Weighted least-squares:  min_s,t  Σ w·(y − s·x − t)²
-    # Closed form:
-    #   s = (Σw·Σwxy − Σwx·Σwy) / (Σw·Σwx² − (Σwx)²)
-    #   t = (Σwy − s·Σwx) / Σw
+    x = da3_depth[v, u].float()             # [M]
+    y = colmap_depths.float()               # [M]
+    w = torch.ones_like(x)
+
+    # Weighted least squares: s, t minimise Σ w(y - sx - t)²
     sw   = w.sum()
     swx  = (w * x).sum()
     swy  = (w * y).sum()
@@ -636,224 +591,57 @@ def align_depth_scale(
     else:
         s = float(((sw * swxy - swx * swy) / denom).item())
         t = float(((swy - s * swx) / sw).item())
-    
-    D_reg = s * D_pre + t
-    
-    return s, t, D_reg
+
+    aligned = (s * da3_depth + t).clamp(min=0.0)
+    return s, t, aligned
 
 
 # =============================================================================
-# SECTION 8 — GAUSSIAN MODEL  (learnable parameters)
+# DATASET HELPER — how to load DA3 depth as "mini_depth" in colmap.py Dataset
 # =============================================================================
+"""
+HOW TO ADD DA3 DEPTH TO THE DATASET
+─────────────────────────────────────
+In datasets/colmap.py, inside Dataset.__getitem__, after loading the image:
 
-class GaussianModel(nn.Module):
-    """
-    Learnable 3D Gaussian scene representation.
+    # 1. Load pre-computed aligned DA3 depth (saved as .npy, one per image)
+    if self.load_da3_depth:
+        image_name = self.parser.image_names[index]
+        stem = os.path.splitext(image_name)[0]
+        da3_path = os.path.join(self.da3_depth_dir, stem + ".npy")
+        if os.path.exists(da3_path):
+            da3 = np.load(da3_path).astype(np.float32)   # [H_full, W_full]
+            # Resize to match the downsampled image
+            h, w = image.shape[:2]
+            da3 = cv2.resize(da3, (w, h), interpolation=cv2.INTER_LINEAR)
+            data["mini_depth"] = torch.from_numpy(da3)   # [H, W]
+        else:
+            # No DA3 for this image — return zeros (loss will skip these)
+            data["mini_depth"] = torch.zeros(image.shape[:2], dtype=torch.float32)
 
-    Each Gaussian has:
-      means    — 3D world-space centre     (Xw, Yw, Zw)
-      quats    — rotation quaternion       (w, x, y, z)
-      scales   — log scale (3 axes)
-      opacities— pre-sigmoid opacity
-      sh_coeffs— spherical harmonic colour coefficients
-    """
+HOW TO PRE-COMPUTE THE .npy FILES (run once before training):
 
-    def __init__(self, N: int, sh_degree: int = 3):
-        super().__init__()
-        self.sh_degree = sh_degree
-        K = (sh_degree + 1) ** 2  # number of SH bands
+    from depth_anything_3.api import DepthAnything3
+    from ground_plane_losses import align_da3_to_colmap
 
-        self.means     = nn.Parameter(torch.randn(N, 3))
-        self.quats     = nn.Parameter(F.normalize(torch.randn(N, 4), dim=-1))
-        self.log_scales= nn.Parameter(torch.zeros(N, 3))
-        self.logit_opacities = nn.Parameter(torch.zeros(N))
-        self.sh_coeffs = nn.Parameter(torch.zeros(N, K, 3))
+    model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE")
+    model = model.to("cuda")
 
-    @property
-    def scales(self) -> Tensor:
-        return torch.exp(self.log_scales)
-
-    @property
-    def opacities(self) -> Tensor:
-        return torch.sigmoid(self.logit_opacities)
-
-    @property
-    def covars(self) -> Tensor:
-        return quat_scale_to_covar(self.quats, self.scales)
-
-    def get_colors(self, dirs: Tensor) -> Tensor:
-        """
-        Evaluate SH colour for view directions dirs [..., 3].
-        Returns [..., N, 3] RGB colours in [0, 1].
-        """
-        from torch import Tensor as T
-        dirs = F.normalize(dirs, dim=-1)
-        # Simple DC term for now; extend with full SH eval if needed
-        colors = self.sh_coeffs[..., 0, :] * 0.28209479 + 0.5
-        return colors.clamp(0, 1)
-
-
-# =============================================================================
-# SECTION 9 — FULL FORWARD PASS
-# =============================================================================
-
-def render(
-    model:     GaussianModel,
-    viewmats:  Tensor,   # [C, 4, 4]
-    Ks:        Tensor,   # [C, 3, 3]
-    width:     int,
-    height:    int,
-    masks:     Tensor,   # [C, H, W]  ground segmentation
-    tile_size: int = 16,
-    near_plane: float = 0.01,
-    far_plane:  float  = 1e10,
-    lambda_dist: float = 2.3,
-    target_image: Optional[Tensor] = None,  # [C, H, W, 3]
-) -> dict:
-    """
-    Full forward render pass with ground-plane depth supervision.
-
-    Returns a dict with:
-      means2d, conics, depths, radii  — projection outputs
-      D_gt                            — ground-plane depth maps
-      isect_offsets, flatten_ids      — tile rasterisation tables
-      loss (if target_image given)    — total training loss
-    """
-    C = viewmats.shape[0]
-    N = model.means.shape[0]    
-    
-    tile_w = math.ceil(width  / tile_size)
-    tile_h = math.ceil(height / tile_size)
-
-    # ---- Forward projection + depth maps ----
-    means2d, conics, depths_zc, radii, D_gt, valid = ground_plane_depth_guided(
-        model.means, model.covars,
-        viewmats, Ks, masks,
-        width, height,
-        near_plane=near_plane, far_plane=far_plane,
+    prediction = model.inference(
+        images,
+        extrinsics=extrinsics,      # from COLMAP
+        intrinsics=intrinsics,
+        align_to_input_ext_scale=True,
     )
 
-    # ---- Tile intersection ----
-    _, isect_ids, flatten_ids = isect_tiles(
-        means2d, radii, depths_zc,
-        tile_size, tile_w, tile_h,
-    )
-    isect_offsets = isect_offset_encode(isect_ids, C, tile_w, tile_h)
-
-    out = dict(
-        means2d=means2d,
-        conics=conics,
-        depths_zc=depths_zc,
-        radii=radii,
-        D_gt=D_gt,
-        valid=valid,
-        isect_ids=isect_ids,
-        flatten_ids=flatten_ids,
-        isect_offsets=isect_offsets,
-    )
-
-    if target_image is not None:
-        # Placeholder rendered image — in practice this comes from
-        # _rasterize_to_pixels using the tile tables above.
-        rendered = torch.zeros_like(target_image)
-
-        L, Lcolor, Ldist = total_loss(
-            rendered, target_image,
-            depths_zc, D_gt, means2d,
-            width, height,
-            lambda_dist=lambda_dist,
+    for i, (depth, name) in enumerate(zip(prediction.depth, image_names)):
+        # depth is [H, W] float32, already metric if align_to_input_ext_scale=True
+        # But double-check with COLMAP sparse points for extra robustness:
+        s, t, aligned = align_da3_to_colmap(
+            da3_depth     = torch.from_numpy(depth),
+            colmap_points = colmap_point_pixels[i],   # [M, 2]
+            colmap_depths = colmap_depth_values[i],   # [M]
         )
-        out.update(loss=L, Lcolor=Lcolor, Ldist=Ldist)
-        
-    return out
-
-
-# =============================================================================
-# SECTION 10 — TRAINING LOOP SKETCH
-# =============================================================================
-
-def train(
-    model: GaussianModel,
-    viewmats_list: list,   # list of [C, 4, 4] tensors per training step
-    Ks_list: list,
-    masks_list: list,
-    targets_list: list,    # list of [C, H, W, 3] ground-truth images
-    width: int,
-    height: int,
-    n_iters: int = 30_000,
-    lr: float = 1e-3,
-    lambda_dist: float = 2.3,
-):
-    """
-    Minimal training loop following the paper:
-      - 30 000 iterations
-      - Adam optimiser
-      - Loss = Lcolor + 2.3 · Ldist
-    """
-    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
-
-    for step in range(n_iters):
-        idx = step % len(viewmats_list)
-        viewmats = viewmats_list[idx]
-        Ks       = Ks_list[idx]
-        masks    = masks_list[idx]
-        target   = targets_list[idx]
-
-        optimiser.zero_grad()
-
-        out = render(
-            model, viewmats, Ks,
-            width, height, masks,
-            target_image=target,
-            lambda_dist=lambda_dist,
-        )
-
-        loss = out["loss"]
-        loss.backward()
-        optimiser.step()
-
-        if step % 1000 == 0:
-            print(
-                f"step {step:5d}  "
-                f"loss={loss.item():.4f}  "
-                f"Lcolor={out['Lcolor'].item():.4f}  "
-                f"Ldist={out['Ldist'].item():.4f}"
-            )
-    
-    return model
-
-
-# =============================================================================
-# QUICK SMOKE TEST
-# =============================================================================
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    device = "cpu"
-
-    N, C, H, W = 64, 2, 64, 64
-
-    model = GaussianModel(N, sh_degree=1).to(device)
-
-    # Identity cameras looking forward along +Z
-    viewmats = torch.eye(4, device=device).unsqueeze(0).repeat(C, 1, 1)
-    viewmats[:, 2, 3] = -5.0  # move cameras back 5 units
-
-    Ks = torch.tensor([[
-        [50.0,  0.0, W/2],
-        [ 0.0, 50.0, H/2],
-        [ 0.0,  0.0,  1.0],
-    ]], device=device).repeat(C, 1, 1)
-
-    # Mark lower half of each camera image as ground
-    masks = torch.zeros(C, H, W, dtype=torch.bool, device=device)
-    masks[:, H//2:, :] = True
-
-    out = render(model, viewmats, Ks, W, H, masks)
-
-    print("means2d shape  :", out["means2d"].shape)
-    print("conics shape   :", out["conics"].shape)
-    print("D_gt shape     :", out["D_gt"].shape)
-    print("isect_offsets  :", out["isect_offsets"].shape)
-    print("n_isects       :", out["flatten_ids"].shape[0])
-    print("Smoke test passed.")
+        stem = os.path.splitext(name)[0]
+        np.save(f"/data/da3_aligned/{stem}.npy", aligned.numpy())
+"""

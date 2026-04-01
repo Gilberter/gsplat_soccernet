@@ -432,7 +432,7 @@ class Config:
     camera_model: CameraModel = "pinhole"
 
     # Load per-image exposure from EXIF metadata
-    load_exposure: bool = True
+    load_exposure: bool = False
 
     # --------------------------------------------------------------------------
     # Ground-plane depth supervision  ★ NEW — tune these
@@ -1128,18 +1128,24 @@ class Runner:
             # ── Original COLMAP sparse depth loss (optional) ─────────────────
             depthloss = torch.tensor(0.0, device=device)
             if cfg.depth_loss and depths_image is not None:
-                pts_norm = torch.stack([
-                    points[:, :, 0] / (width  - 1) * 2 - 1,
-                    points[:, :, 1] / (height - 1) * 2 - 1,
-                ], dim=-1)
-                grid = pts_norm.unsqueeze(2)
-                d_sampled = F.grid_sample(
-                    depths_image.permute(0, 3, 1, 2),
-                    grid, align_corners=True,
-                ).squeeze(3).squeeze(1)
-                disp    = torch.where(d_sampled > 0.0, 1.0 / d_sampled, torch.zeros_like(d_sampled))
-                disp_gt = 1.0 / depths_gt
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                
+                # pts_norm = torch.stack([
+                #     points[:, :, 0] / (width  - 1) * 2 - 1,
+                #     points[:, :, 1] / (height - 1) * 2 - 1,
+                # ], dim=-1)
+                # grid = pts_norm.unsqueeze(2)
+                # d_sampled = F.grid_sample(
+                #     depths_image.permute(0, 3, 1, 2),
+                #     grid, align_corners=True,
+                # ).squeeze(3).squeeze(1)
+                # disp    = torch.where(d_sampled > 0.0, 1.0 / d_sampled, torch.zeros_like(d_sampled))
+                # disp_gt = 1.0 / depths_gt
+
+                # LOAD DEPTH MAP [H,W] from DA3 Model
+                depth_map = data["mini_depth"].to(device)  # [H, W]
+                # Where depths_image is the rendered depth map from gaussian splatting in rasterization
+
+                depthloss = F.l1_loss(depths_image, depth_map) * self.scene_scale
                 loss = loss + depthloss * cfg.depth_lambda
 
             # ──────────────────────────────────────────────────────────────────

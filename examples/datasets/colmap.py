@@ -411,7 +411,8 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
-        load_ground_masks: str = ""
+        load_ground_masks: str = "",
+        load_mini_npz: str = ""
     ):
         super().__init__()
         self.parser = parser
@@ -419,7 +420,7 @@ class Dataset:
         self.patch_size = patch_size
         self.load_depths = load_depths
         self.load_ground_masks = load_ground_masks
-
+        self.load_mini_npz = load_mini_npz
         
         # Validate the mask directory exists and index available files
         self.ground_mask_files = {}
@@ -431,6 +432,20 @@ class Dataset:
                 stem = os.path.splitext(fname)[0]
                 self.ground_mask_files[stem] = os.path.join(load_ground_masks, fname)
         print(f"Ground Mask Files {len(self.ground_mask_files)}")
+
+        if self.load_mini_npz != "":
+            assert os.path.exists(load_mini_npz), \
+                f"mini_npz file {load_mini_npz} does not exist."
+            mini_data = np.load(load_mini_npz)
+            self.mini_depths = mini_data['depths']  # (N, H, W)
+            self.mini_confidences = mini_data['confidences']  # (N, H, W)
+            #self.mini_extrinsics = mini_data['extrinsics']  # (N, 4, 4) 
+            #self.mini_intrinsics = mini_data['intrinsics']  # (N, 3, 3) 
+        else:
+            C = len(set(parser.camera_ids))
+            H,W = self.parser.imsize_dict[camera_ids[0]]
+            self.mini_depths= torch.zeros((C,H,W), dtype=torch.float32)
+            self.mini_confidences = torch.zeros((C,H,W), dtype=torch.float32)
 
         indices = np.arange(len(self.parser.image_names))
         if self.parser.test_every == 0:
@@ -546,6 +561,17 @@ class Dataset:
                 ground_mask = torch.zeros(h, w, dtype=torch.bool)
 
             data["ground_mask"] = ground_mask  # [H, W] bool
+        if self.load_mini_npz != "":
+            data["mini_depth"] = torch.from_numpy(self.mini_depths[index]).float().unsqueeze(0)  # [1, H, W]
+            data["mini_confidence"] = torch.from_numpy(self.mini_confidences[index]).float().unsqueeze(0)  # [1, H, W]
+            #data["mini_extrinsic"] = torch.from_numpy(self.mini_extrinsics[index]).float()  # [4, 4]
+            #data["mini_intrinsic"] = torch.from_numpy(self.mini_intrinsics[index]).float()  # [3, 3]}
+
+            # Check Dimentions of the depth map match with the image dimensions
+            if data["mini_depth"].shape != data["image"].shape[:2]:
+                print(f"Warning: mini_depth shape {data['mini_depth'].shape} does not match image shape {data['image'].shape[:2]}. Resizing mini_depth.")
+            # For testing save the depth map to check if it match with the image
+
         return data
 
 
