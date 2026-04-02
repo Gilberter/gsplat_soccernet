@@ -442,8 +442,8 @@ class Dataset:
             #self.mini_extrinsics = mini_data['extrinsics']  # (N, 4, 4) 
             #self.mini_intrinsics = mini_data['intrinsics']  # (N, 3, 3) 
         else:
-            C = len(set(parser.camera_ids))
-            H,W = self.parser.imsize_dict[camera_ids[0]]
+            C = len(set(self.parser.camera_ids))
+            H,W = self.parser.imsize_dict[self.parser.camera_ids[0]]
             self.mini_depths= torch.zeros((C,H,W), dtype=torch.float32)
             self.mini_confidences = torch.zeros((C,H,W), dtype=torch.float32)
 
