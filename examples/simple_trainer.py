@@ -91,7 +91,7 @@ class Config:
     # Camera model
     camera_model: CameraModel = "pinhole"
     # Load EXIF exposure metadata from images (if available)
-    load_exposure: bool = True
+    load_exposure: bool = False
 
     # Port for the viewer server
     port: int = 8080

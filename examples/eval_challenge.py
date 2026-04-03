@@ -13,13 +13,14 @@ def main(args):
     os.makedirs(args.data_dir, exist_ok=True)
 
     # --- Load Gaussians ---
-    means, quats, scales, opacities, colors, sh_degree = load_splats(args.ckpt, device)
+    means, quats, scales, opacities, colors, sh_degree, app_module, features = load_splats(args.ckpt, device)
 
     
 
-
-    sh_degree_render = min(args.max_sh_degree, sh_degree)
-    
+    if sh_degree is not None:
+        sh_degree_render = min(args.max_sh_degree, sh_degree)
+    else:
+        sh_degree_render = None
     c2w_mats, ks_list, imsize_list, image_ids = load_challenges(f"{args.data_dir}/sparse/0", factor=2)
     n_cameras = len(image_ids)
 
@@ -56,7 +57,7 @@ def main(args):
             sh_degree_render, c2w, K,
             width, height,
             near=args.near, far=args.far,
-            device=device,
+            device=device, app_module=app_module, features=features
         )
         
         

@@ -19,40 +19,87 @@ from pathlib import Path
 from gsplat.rendering import rasterization
 
 from scipy.spatial.transform import Rotation as qua2rot
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 import PIL
 
 import cv2
 def load_splats(ckpt_paths, device):
     means, quats, scales, opacities, sh0, shN = [], [], [], [], [], []
+    app_modules,features,colors_base = [],[],[] # WHEN TRAINED WHEN APPMODULE
+    mode = None
     for ckpt_path in ckpt_paths:
-        ckpt = torch.load(ckpt_path, map_location=device)["splats"]
-        means.append(ckpt["means"])
-        quats.append(F.normalize(ckpt["quats"], p=2, dim=-1))
-        scales.append(torch.exp(ckpt["scales"]))
-        opacities.append(torch.sigmoid(ckpt["opacities"]))
-        sh0.append(ckpt["sh0"])
-        shN.append(ckpt["shN"])
+        ckpt = torch.load(ckpt_path, map_location=device)
+        splats = ckpt["splats"]
+        
+        means.append(splats["means"])
+        quats.append(F.normalize(splats["quats"], p=2, dim=-1))
+        scales.append(torch.exp(splats["scales"]))
+        opacities.append(torch.sigmoid(splats["opacities"]))
+        if "sh0" not in splats or "shN" not in splats:
+            features.append(splats["features"])   # [N, 32]
+            colors_base.append(splats["colors"])  # [N, 3] logit-space base colors
+            for key in splats.keys():
+                print(f"  - {key}: {splats[key].shape}")
+            app_state = ckpt["app_module"] if "app_module" in ckpt else None
+            print(f"Warning: 'sh0' or 'shN' not found in {ckpt_path}. Using RGB colors instead.")
+            app_module = AppearanceOptModule(
+                n=421,     # Must match training!
+                feature_dim=32,          # Must match training!
+                embed_dim=16,            # Must match training!
+                sh_degree=3,             # Must match training!
+            ).to(device)
+            app_module.load_state_dict(ckpt["app_module"])
+            print(f"✓ Found app_module state_dict with keys")
+            print(f"  → App mode | features={splats['features'].shape} {splats['colors'].shape} | app_module loaded ✓")
+
+            app_module.eval()  # Set to evaluation mode
+            app_modules.append(app_module)
+            mode = "app"
+        else:
+            sh0.append(ckpt["sh0"])
+            shN.append(ckpt["shN"])
+            print(f"  → SH mode | sh0={splats['sh0'].shape} shN={splats['shN'].shape}")
+
+            mode = "sh"
     means     = torch.cat(means, dim=0)
     quats     = torch.cat(quats, dim=0)
     scales    = torch.cat(scales, dim=0)
     opacities = torch.cat(opacities, dim=0)
-    colors    = torch.cat([torch.cat(sh0, dim=0), torch.cat(shN, dim=0)], dim=-2)
-    sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
+    if mode == "app":
+        features  = torch.cat(features, dim=0)
+        colors = torch.cat(colors_base, dim=0)
+        sh_degree = None
+    if mode == "sh":
+        colors    = torch.cat([torch.cat(sh0, dim=0), torch.cat(shN, dim=0)], dim=-2)
+        sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
     print(f"Loaded {len(means)} Gaussians | sh_degree={sh_degree}")
-    return means, quats, scales, opacities, colors, sh_degree
+    return means, quats, scales, opacities, colors, sh_degree, app_modules[0] if mode == "app" else None, features if mode == "app" else None
 
 
 @torch.no_grad()
 def render_camera(means, quats, scales, opacities, colors, sh_degree,
-                  c2w_np, K_np, width, height, near, far, device):
+                  c2w_np, K_np, width, height, near, far, device, app_module=None, features=None):
     c2w = torch.from_numpy(c2w_np).float().to(device)
     K   = torch.from_numpy(K_np).float().to(device)
     viewmat = c2w.inverse().unsqueeze(0)  # [1, 4, 4]
     K_batch = K.unsqueeze(0)              # [1, 3, 3]
 
+    if app_module is not None and features is not None:
+        # ── App mode: evaluate MLP with neutral (zero) embedding ──────────
+        dirs = means[None, :, :] - c2w[None, :3, 3]   # [1, N, 3]
+        render_colors_eval = app_module(
+            features  = features,
+            embed_ids = None,      # None → zero embedding (novel / neutral view)
+            dirs      = dirs,
+            sh_degree = 3,
+        )
+        render_colors_eval = render_colors_eval + colors   # residual
+        render_colors_eval = torch.sigmoid(render_colors_eval)  # [1, N, 3]
+    else:
+        render_colors_eval = colors
     render_colors, render_alphas, info = rasterization(
-        means, quats, scales, opacities, colors,
+        means, quats, scales, opacities, render_colors_eval,
         viewmat, K_batch,
         width=width, height=height,
         sh_degree=sh_degree,
