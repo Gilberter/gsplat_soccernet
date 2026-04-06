@@ -934,7 +934,11 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
+                data = {
+                    "step": step, 
+                    "splats": self.splats.state_dict(),
+                    "n_train_images": len(self.trainset),
+                    }
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -945,6 +949,7 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                        data["app_embed_dim"] = cfg.app_embed_dim
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
                 torch.save(

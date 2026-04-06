@@ -3,9 +3,9 @@
 #SBATCH --output=./logs/colmap_rendering_%j.out
 #SBATCH --account=gs_hyperspectral
 #SBATCH --error=./logs/error_rendering_%j.log 
-#SBATCH --cpus-per-task=10
+#SBATCH --cpus-per-task=5
 #SBATCH --partition=gpu 
-#SBATCH --mem=10G
+#SBATCH --mem=8G
 #SBATCH --time=01:00:00
 
 # Create logs directory if it doesn't exist
@@ -19,8 +19,8 @@ echo "Working directory: $(pwd)"
 source /opt/miniforge3/etc/profile.d/conda.sh
 conda activate soccernet
 
-# Fix common libstdc++ issues by preloading the conda version
 export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
+
 
 # Verify environment and GPU access
 srun python3 -c "
@@ -33,12 +33,31 @@ if torch.cuda.is_available():
 print(f'Arch list: {torch.cuda.get_arch_list()}')
 "
 
-RESULT_FOLDER="/disk/SN-NVS-2026-raw/results-soccernet/scene-1-scene-1-ultimate-8"
-CKPT="$RESULT_FOLDER/ckpts/ckpt_29999_rank0.pt"
-CHALLENGE_DIR="/disk/SN-NVS-2026-raw/scene-1-challenge"
+SCENE=$1
+VERSION=$2
+CKPT_RANK=${3:-290000}  # Default checkpoint rank to evaluate
+
+VERSION_NAME=$(basename "$VERSION")
+echo "$VERSION_NAME"
+
+CHALLENGE_DIR="/disk/SN-NVS-2026-raw/${SCENE}-challenge"
+CKPT_DIR="/disk/SN-NVS-2026-raw/results-soccernet/${VERSION_NAME}/ckpts/ckpt_${CKPT_RANK}_rank0.pt"
+RESULT_DIR=""
+
+RESULT_BASE_DIR="${CHALLENGE_DIR}/${VERSION_NAME}"
+
+if [ -d "$RESULT_BASE_DIR" ]; then
+    RESULT_DIR=${RESULT_BASE_DIR}/results-${CKPT_RANK}
+else
+    RESULT_DIR="${CHALLENGE_DIR}/${VERSION_NAME}"
+fi
+
+echo "Target Result Folder: $RESULT_DIR"
+echo "Target Checkpoint: $CKPT_DIR"
 
 # Execute the evaluation script
 srun python /home/hensemberk/dev/Soccernet/gsplat/examples/eval_challenge.py \
-    --ckpt "$CKPT" \
+    --ckpt "$CKPT_DIR" \
     --data_dir "$CHALLENGE_DIR" \
-    --result_folder "$RESULT_FOLDER"
+    --result_folder "$RESULT_DIR" \
+    --specific

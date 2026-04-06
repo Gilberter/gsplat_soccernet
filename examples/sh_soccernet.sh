@@ -17,6 +17,7 @@ conda activate soccernet
 
 export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
 
+
 srun python3 -c "
 import torch
 print(f'PyTorch: {torch.__version__}')
@@ -43,19 +44,16 @@ PACKED_MODE=${10:-1}     # Default: ON (reduces memory)
 DATA_FACTOR=${11:-1}     # Default: 1 (full resolution)
 
 # MORE SETTINGS (tune for best PSNR, but may increase memory):
-SSIM_LAMBDA=${12:-0.2}  # Default: 0.2 (tune for best PSNR)
-OPACITY_REG=${13:-0.01}  # Default: 0.01 (tune for best PSNR)
-SCALE_REG=${14:-0.01}    # Default: 0.01 
-APP_EMDED_DIM=${15:-16}  # Default: 64 (tune for best PSNR)
-SSIM_LAMBDA=${12:-0.2}        # Default: 0.2 (tune for best PSNR)
-OPACITY_REG=${13:-0.01}       # Default: 0.01 (tune for best PSNR)
-SCALE_REG=${14:-0.01}         # Default: 0.01 
-APP_EMBED_DIM=${15:-16}       # Default: 16 (tune: 8, 16, 32, 64)
-FEATURE_DIM=${16:-32}         # Default: 32 (tune: 16, 32, 64 when app_opt=ON)
-GROW_GRAD2D=${17:-0.0008}     # Default: 0.0008 (for absgrad)
-BILATERAL_SHAPE_X=${18:-16}   # Bilateral grid X dimension
-BILATERAL_SHAPE_Y=${19:-16}   # Bilateral grid Y dimension
-BILATERAL_SHAPE_W=${20:-8}    # Bilateral grid color dimension
+
+SSIM_LAMBDA=${SSIM_LAMBDA:-0.2}        # Default: 0.2 (tune for best PSNR)
+OPACITY_REG=${OPACITY_REG:-0.01}       # Default: 0.01 (tune for best PSNR)
+SCALE_REG=${SCALE_REG:-0.01}         # Default: 0.01 
+APP_EMBED_DIM=${APP_EMBED_DIM:-16}       # Default: 16 (tune: 8, 16, 32, 64)
+FEATURE_DIM=${FEATURE_DIM:-32}         # Default: 32 (tune: 16, 32, 64 when app_opt=ON)
+GROW_GRAD2D=${GROW_GRAD2D:-0.0008}     # Default: 0.0008 (for absgrad)
+BILATERAL_SHAPE_X=${BILATERAL_SHAPE_X:-16}   # Bilateral grid X dimension
+BILATERAL_SHAPE_Y=${BILATERAL_SHAPE_Y:-16}   # Bilateral grid Y dimension
+BILATERAL_SHAPE_W=${BILATERAL_SHAPE_W:-8}    # Bilateral grid color dimension
 
 
 
@@ -68,7 +66,7 @@ fi
 if [ "$DENSIFICATION" -eq 1 ]; then
     DENSIFICATION_STRATEGY="mcmc"
 else
-    DENSIFICATION_STRATEGY="default"
+    DENSIFICATION_STRATEGY="default --strategy.grow_grad2d $GROW_GRAD2D"
 fi
 
 # Post-processing mode selection
@@ -98,110 +96,85 @@ FLAGS=""
 DATA_DIR=/disk/SN-NVS-2026-raw/${SCENE}
 RESULT_DIR=/disk/SN-NVS-2026-raw/results-soccernet/${SCENE}-${VERSION}
 COLMAP_DIR=/disk/SN-NVS-2026-raw/${SCENE}/sparse/0
-CKPT=$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt
 CHALLENGE_DIR=/disk/SN-NVS-2026-raw/${SCENE}-challenge
 
+BASE_DIR="$CHALLENGE_DIR/${SCENE}-${VERSION}"
+RESULT_BASE=/disk/SN-NVS-2026-raw/results-soccernet/${SCENE}-${VERSION}
 
-# -------------------------
-# Memory & OOM Monitoring Setup
-# -------------------------
-mkdir -p ./logs
-MEMORY_LOG="./logs/memory_${SLURM_JOB_ID}.csv"
-OOM_LOG="./logs/oom_${SLURM_JOB_ID}.log"
-PEAK_MEMORY_LOG="./logs/peak_memory_${SLURM_JOB_ID}.txt"
-TRAINING_LOG=$RESULT_DIR/training_${SLURM_JOB_ID}.log
 
-# Initialize memory logs
-echo "timestamp,step,cpu_used_mb,cpu_available_mb,gpu_used_mb,gpu_total_mb,gpu_util_percent" > "$MEMORY_LOG"
-echo "OOM Events Log - Job: $SLURM_JOB_ID" > "$OOM_LOG"
-
-monitor_memory() {
-    while true; do
-        TIMESTAMP=$(date +%s.%N)
-        
-        # CPU Memory
-        CPU_STATS=$(free -m | awk '/Mem:/ {print $3","$7}')
-        
-        # GPU Memory
-        GPU_MEM=$(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits | tr ',' ' ')
-        
-        if [ ! -z "$GPU_MEM" ]; then
-            echo "$TIMESTAMP,0,$CPU_STATS,$GPU_MEM" >> "$MEMORY_LOG"
-        fi
-        
-        sleep 1
+if [ -d "$RESULT_BASE" ]; then
+    i=1
+    while [ -d "${RESULT_BASE}_run$i" ]; do
+        ((i++))
     done
-}
+    RESULT_DIR="${RESULT_BASE}_run$i"
+    OUTPUT_DIR="${BASE_DIR}_run$i"
+else
+    RESULT_DIR="$RESULT_BASE"
+    OUTPUT_DIR="$BASE_DIR"
+fi
 
-check_oom_errors() {
-    while true; do
-        if grep -q "CUDA out of memory" "$TRAINING_LOG" 2>/dev/null; then
-            echo "[$(date)] OOM detected in training log" >> "$OOM_LOG"
-            # Log current memory state
-            nvidia-smi >> "$OOM_LOG"
-            echo "---" >> "$OOM_LOG"
-        fi
-        sleep 5
-    done
-}
+mkdir -p "$RESULT_DIR"
+
+mkdir -p "$OUTPUT_DIR"
 
 
-echo "============================="
-echo "🎯 MEMORY-OPTIMIZED CONFIGURATION"
-echo "============================="
-echo "Rasterize mode:      $RASTERIZE_MODE"
-echo "DATA_FACTOR:         $DATA_FACTOR"
-echo "PACKED_MODE:         $([ "$PACKED_MODE"     -eq 1 ] && echo ON || echo off)"
-echo "BILATERAL_GRID:      $([ "$BILATERAL"       -eq 1 ] && echo ON || echo off)"
-echo "APP_OPT:             $([ "$APP_OPT"         -eq 1 ] && echo ON || echo off)"
-echo "ABSGRAD:             $([ "$ABSGRAD"         -eq 1 ] && echo ON || echo off)"
-echo "ANTIALIASED:         $([ "$ANTIALIASED"     -eq 1 ] && echo ON || echo off)"
-echo "DENSIFICATION:       $DENSIFICATION_STRATEGY"
-echo "============================="
-echo "SCENE:               $SCENE"
-echo "VERSION:             $VERSION"
-echo "MAX_STEPS:           $MAX_STEPS"
-echo "DATA_DIR:            $DATA_DIR"
-echo "RESULT_DIR:          $RESULT_DIR"
-echo "MEMORY_LOG:          $MEMORY_LOG"
-echo "GPU_LOG:             $GPU_LOG"
-echo "============================="
+CKPT=$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt
 
-# Start memory monitors in background
-monitor_memory & 
-MONITOR_PID=$!
+LOG_FILE_TRAIN=$RESULT_DIR/run_config.txt
 
-check_oom_errors &
-OOM_CHECK_PID=$!
 
-# --- TRAP TO CLEAN UP MONITORS ---
-trap "kill $MONITOR_PID $OOM_CHECK_PID 2>/dev/null; analyze_memory" EXIT
+{
+echo "============================================================"
+echo "⚙️ CONFIGURATION"
+echo "============================================================"
 
-echo "Memory monitors started with PIDs $MONITOR_PID $OOM_CHECK_PID"
+printf "%-25s %s\n" "Scene:" "$SCENE"
+printf "%-25s %s\n" "Version:" "$VERSION"
+printf "%-25s %s\n" "Max steps:" "$MAX_STEPS"
+printf "%-25s %s\n" "Data factor:" "$DATA_FACTOR"
 
-analyze_memory() {
-    if [ -f "$MEMORY_LOG" ]; then
-        echo ""
-        echo "===== FINAL MEMORY ANALYSIS ====="
-        PEAK_GPU=$(awk -F',' 'NR>1 {print $5}' "$MEMORY_LOG" | sort -nr | head -1)
-        PEAK_CPU=$(awk -F',' 'NR>1 {print $3}' "$MEMORY_LOG" | sort -nr | head -1)
-        AVG_GPU=$(awk -F',' 'NR>1 {sum+=$5; count++} END {print int(sum/count)}' "$MEMORY_LOG")
-        
-        echo "Peak GPU Memory:    ${PEAK_GPU}MB"
-        echo "Peak CPU Memory:    ${PEAK_CPU}MB"
-        echo "Average GPU Memory: ${AVG_GPU}MB"
-        
-        echo "Peak GPU: ${PEAK_GPU}MB" > "$PEAK_MEMORY_LOG"
-        echo "Peak CPU: ${PEAK_CPU}MB" >> "$PEAK_MEMORY_LOG"
-        echo "Average GPU: ${AVG_GPU}MB" >> "$PEAK_MEMORY_LOG"
-        echo "Timestamp: $(date)" >> "$PEAK_MEMORY_LOG"
-    fi
-}
+echo "------------------------------------------------------------"
 
+printf "%-25s %s\n" "Raster mode:" "$RASTERIZE_MODE"
+printf "%-25s %s\n" "Packed mode:" "$([ "$PACKED_MODE" -eq 1 ] && echo ON || echo OFF)"
+printf "%-25s %s\n" "Absgrad:" "$([ "$ABSGRAD" -eq 1 ] && echo ON || echo OFF)"
+printf "%-25s %s\n" "App opt:" "$([ "$APP_OPT" -eq 1 ] && echo ON || echo OFF)"
+printf "%-25s %s\n" "Bilateral:" "$([ "$BILATERAL" -eq 1 ] && echo ON || echo OFF)"
+printf "%-25s %s\n" "Antialiased:" "$([ "$ANTIALIASED" -eq 1 ] && echo ON || echo OFF)"
+
+echo "------------------------------------------------------------"
+
+printf "%-25s %s\n" "Opacity reg:" "$OPACITY_REG"
+printf "%-25s %s\n" "Scale reg:" "$SCALE_REG"
+printf "%-25s %s\n" "App embed dim:" "$APP_EMBED_DIM"
+
+echo "============================================================"
+
+echo "============================================================"
+echo "📂 PATHS"
+echo "============================================================"
+
+printf "%-20s %s\n" "DATA_DIR:" "$DATA_DIR"
+printf "%-20s %s\n" "RESULT_DIR:" "$RESULT_DIR"
+printf "%-20s %s\n" "COLMAP_DIR:" "$COLMAP_DIR"
+printf "%-20s %s\n" "CKPT:" "$CKPT"
+
+echo "============================================================"
+
+echo "============================================================"
+echo "🏋️ START TRAINING"
+echo "============================================================"
+
+} >> "$LOG_FILE_TRAIN"
+START_TIME=$(date +%s)
 # -------------------------
 # Training with MEMORY OPTIMIZATIONS
 # -------------------------
+{
 echo "Starting training at $(date)"
+} >> "$LOG_FILE_TRAIN"
+
 srun python /home/hensemberk/dev/Soccernet/gsplat/examples/simple_trainer.py $DENSIFICATION_STRATEGY \
     --max_steps $MAX_STEPS \
     --data_dir $DATA_DIR \
@@ -209,6 +182,7 @@ srun python /home/hensemberk/dev/Soccernet/gsplat/examples/simple_trainer.py $DE
     --save_steps $MAX_STEPS \
     --data_factor $DATA_FACTOR \
     --no-normalize_world_space \
+    --save_steps 10000 20000 30000 40000 \
     --no-load_exposure \
     --test_every 0 \
     --colmap_dir $COLMAP_DIR \
@@ -216,17 +190,29 @@ srun python /home/hensemberk/dev/Soccernet/gsplat/examples/simple_trainer.py $DE
     --disable_viewer \
     \
     --sh_degree 3 \
-    --opacity_reg 0.01 \
-    --scale_reg 0.01 \
+    --opacity_reg $OPACITY_REG \
+    --scale_reg $SCALE_REG \
     \
     --batch_size 1 \
     \
     $FLAGS 
 
 # --ssim_lambda 0.2 \
-# --strategy.grow_grad2d 0.0008 \
+# 
+
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+{
+echo "============================================================"
+echo "✅ TRAINING FINISHED"
+echo "⏱️ Duration: $DURATION seconds (~$((DURATION/60)) min)"
+echo "📅 End time: $(date)"
+echo "============================================================"
 
 echo "Training completed at $(date) with exit code"
+} >> "$LOG_FILE_TRAIN"
 
 # -------------------------
 # Evaluation
@@ -234,44 +220,88 @@ echo "Training completed at $(date) with exit code"
 srun python /home/hensemberk/dev/Soccernet/gsplat/examples/eval_challenge.py \
     --ckpt $CKPT \
     --data_dir $CHALLENGE_DIR \
-    --result_folder "results-${VERSION}-1"
+    --result_folder "$(basename $OUTPUT_DIR)"
 
 
-LOG_FILE=$CHALLENGE_DIR/results-${VERSION}-1/run_config.txt
+LOG_FILE=$OUTPUT_DIR/run_conf.txt
 
 echo "Saving run configuration to $LOG_FILE"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
-cat <<EOL > $LOG_FILE
+cat <<EOL > "$LOG_FILE"
 ================================================================================
-SLURM JOB CONFIGURATION
+SLURM JOB INFO
 ================================================================================
-SLURM_JOB_ID:            $SLURM_JOB_ID
-NODE:                    $SLURM_NODELIST
+Job ID:                $SLURM_JOB_ID
+Node:                  $SLURM_NODELIST
+User:                  $(whoami)
+Start Time:            $(date -d @$START_TIME 2>/dev/null || date)
+End Time:              $(date)
+Duration (sec):        $DURATION
 
 ================================================================================
-MEMORY OPTIMIZATION FLAGS
+ENVIRONMENT
 ================================================================================
-PACKED_MODE:             $([ "$PACKED_MODE"     -eq 1 ] && echo ON || echo off)  
-BILATERAL_GRID:          $([ "$BILATERAL"       -eq 1 ] && echo ON || echo off)  
-APP_OPT:                 $([ "$APP_OPT"         -eq 1 ] && echo ON || echo off) 
-ABSGRAD:                 $([ "$ABSGRAD"         -eq 1 ] && echo ON || echo off) 
+Conda Env:             $CONDA_DEFAULT_ENV
+Python:                $(which python)
+CUDA Visible Devices:  $CUDA_VISIBLE_DEVICES
 
 ================================================================================
-CONFIGURATION
+DATA PATHS
 ================================================================================
-Rasterize mode:          $RASTERIZE_MODE
-ANTIALIASED:             $([ "$ANTIALIASED"     -eq 1 ] && echo ON || echo off)
-DENSIFICATION_STRATEGY:  $DENSIFICATION_STRATEGY
-SCENE:                   $SCENE
-VERSION:                 $VERSION
-MAX_STEPS:               $MAX_STEPS
-DATA_FACTOR:             $DATA_FACTOR
+DATA_DIR:              $DATA_DIR
+RESULT_DIR:            $RESULT_DIR
+COLMAP_DIR:            $COLMAP_DIR
+CHALLENGE_DIR:         $CHALLENGE_DIR
+CKPT:                  $CKPT
 
-Your Config:
-packed=ON, absgrad=ON, app_opt=$([ "$APP_OPT" -eq 1 ] && echo ON || echo off), bilateral=$([ "$BILATERAL" -eq 1 ] && echo ON || echo off)
-Estimated Total:         
+================================================================================
+MAIN CONFIGURATION
+================================================================================
+Scene:                 $SCENE
+Version:               $VERSION
+Max Steps:             $MAX_STEPS
+Data Factor:           $DATA_FACTOR
+
+================================================================================
+TRAINING FLAGS
+================================================================================
+Raster Mode:           $RASTERIZE_MODE
+Packed Mode:           $([ "$PACKED_MODE" -eq 1 ] && echo ON || echo OFF)
+AbsGrad:               $([ "$ABSGRAD" -eq 1 ] && echo ON || echo OFF)
+App Opt:               $([ "$APP_OPT" -eq 1 ] && echo ON || echo OFF)
+Bilateral Grid:        $([ "$BILATERAL" -eq 1 ] && echo ON || echo OFF)
+Antialiased:           $([ "$ANTIALIASED" -eq 1 ] && echo ON || echo OFF)
+
+Densification:         $DENSIFICATION_STRATEGY
+
+================================================================================
+HYPERPARAMETERS
+================================================================================
+Opacity Reg:           $OPACITY_REG
+Scale Reg:             $SCALE_REG
+SSIM Lambda:           $SSIM_LAMBDA
+App Embed Dim:         $APP_EMBED_DIM
+Feature Dim:           $FEATURE_DIM
+Grow Grad2D:           $GROW_GRAD2D
+
+Bilateral Shape X:     $BILATERAL_SHAPE_X
+Bilateral Shape Y:     $BILATERAL_SHAPE_Y
+Bilateral Shape W:     $BILATERAL_SHAPE_W
+
+================================================================================
+FULL COMMAND (REPRODUCIBILITY)
+================================================================================
+python simple_trainer.py $DENSIFICATION_STRATEGY \
+    --max_steps $MAX_STEPS \
+    --data_dir $DATA_DIR \
+    --result_dir $RESULT_DIR \
+    --data_factor $DATA_FACTOR \
+    --colmap_dir $COLMAP_DIR \
+    --rasterize_mode $RASTERIZE_MODE \
+    $FLAGS
+
 ================================================================================
 EOL
 

@@ -52,24 +52,67 @@ def main(args):
         print(f"  cam {idx} | image_id={image_ids[idx]} | "
             f"{width}x{height} | t={c2w[:3,3].round(2)} k={K.shape}")
 
-        left_image, n = render_camera(
+        render_out, n = render_camera(
             means, quats, scales, opacities, colors,
             sh_degree_render, c2w, K,
             width, height,
             near=args.near, far=args.far,
             device=device, app_module=app_module, features=features
         )
+
+        print(f" SHAPE render_out {render_out.shape}")
+
+        print(f" SHAPE render_out {render_out.max()}")
+
+
+        if isinstance(render_out, torch.Tensor):
+            print("Tensor")
+            render_out = render_out.detach().cpu().numpy()
+
+        # Shape guard: must be (H, W, 3)
+        if render_out.ndim == 4:
+            print(f"fOR DIM")
+            render_out = render_out.squeeze(0)          # remove batch dim if present
+ 
+        if render_out.shape[-1] > 3:
+            render_out = render_out[..., :3]            # drop depth / alpha channel
+        elif render_out.shape[-1] < 3:
+            raise ValueError(
+                f"Unexpected render output channels: {render_out.shape}. "
+                "Expected (H, W, 3) or (H, W, 4)."
+            )
+ 
+        assert render_out.ndim == 3 and render_out.shape[-1] == 3, \
+            f"render_out has unexpected shape after fix: {render_out.shape}"
+
         
-        
+        # if render_out.dtype != np.uint8:
+        #     render_out = np.clip(render_out * 255.0, 0, 255).astype(np.uint8)
+
+        # if render_out.max() > 255:
+        #     render_out = render_out / (render_out.max() + 1e-8)
+
+        left_image = render_out.copy()   # (H, W, 3) uint8
         tag  = f"{i:05d}"
 
         image_right = f"{args.data_dir}/renders/{path_renders[i]}"
         img_rendered_right = iio.imread(image_right) 
 
-        output_dir = os.path.join(args.data_dir, args.result_folder)
+        print(f" SHAPE render_out {render_out.shape}")
+        print(f" SHAPE image_right {img_rendered_right.shape}")
+
+        print(f" SHAPE img_rendered_right {img_rendered_right.max()}")
+        print(f" SHAPE render_out {render_out.max()}")
+        
+        if args.specific:
+            output_dir = args.result_folder
+
+        else:
+            output_dir = os.path.join(args.data_dir, args.result_folder)
+
+        
+
         save_outputs(output_dir, tag, left_image)
-        
-        
         save_outputs_canvas(output_dir, left_image, img_rendered_right, tag)
 
         for ckpt_path in args.ckpt:
@@ -105,5 +148,8 @@ if __name__ == "__main__":
     # Render params
     parser.add_argument("--near", type=float, default=0.1)
     parser.add_argument("--far",  type=float, default=1000.0)
+    parser.add_argument("--specific", action="store_true")
+
+
     args = parser.parse_args()
     main(args)

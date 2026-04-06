@@ -437,8 +437,9 @@ class Dataset:
             assert os.path.exists(load_mini_npz), \
                 f"mini_npz file {load_mini_npz} does not exist."
             mini_data = np.load(load_mini_npz)
-            self.mini_depths = mini_data['depths']  # (N, H, W)
-            self.mini_confidences = mini_data['confidences']  # (N, H, W)
+            self.mini_depths = mini_data['depth']  # (N, H, W)
+           
+            # self.mini_confidences = mini_data['conf']  # (N, H, W)
             #self.mini_extrinsics = mini_data['extrinsics']  # (N, 4, 4) 
             #self.mini_intrinsics = mini_data['intrinsics']  # (N, 3, 3) 
         else:
@@ -486,6 +487,7 @@ class Dataset:
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
+        
 
         data = {
             "K": torch.from_numpy(K).float(),
@@ -562,8 +564,20 @@ class Dataset:
 
             data["ground_mask"] = ground_mask  # [H, W] bool
         if self.load_mini_npz != "":
-            data["mini_depth"] = torch.from_numpy(self.mini_depths[index]).float().unsqueeze(0)  # [1, H, W]
-            data["mini_confidence"] = torch.from_numpy(self.mini_confidences[index]).float().unsqueeze(0)  # [1, H, W]
+            mini_d = torch.from_numpy(self.mini_depths[index]).float()
+            img_h, img_w = image.shape[:2]
+             # Resize if the npz resolution doesn't match the current image
+            if mini_d.shape != torch.Size([img_h, img_w]):
+                mini_d_np = mini_d.numpy()
+                mini_d_np = cv2.resize(
+                    mini_d_np, (img_w, img_h),
+                    interpolation=cv2.INTER_LINEAR
+                )
+                mini_d = torch.from_numpy(mini_d_np)
+            data["mini_depth"] = mini_d.unsqueeze(0)  # (1, H, W)
+
+           
+            #data["mini_conf"] = torch.from_numpy(self.mini_confidences[index]).float().unsqueeze(0)  # [1, H, W]
             #data["mini_extrinsic"] = torch.from_numpy(self.mini_extrinsics[index]).float()  # [4, 4]
             #data["mini_intrinsic"] = torch.from_numpy(self.mini_intrinsics[index]).float()  # [3, 3]}
 

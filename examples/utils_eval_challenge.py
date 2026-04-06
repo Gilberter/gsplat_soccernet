@@ -36,7 +36,18 @@ def load_splats(ckpt_paths, device):
         quats.append(F.normalize(splats["quats"], p=2, dim=-1))
         scales.append(torch.exp(splats["scales"]))
         opacities.append(torch.sigmoid(splats["opacities"]))
+        
+      
         if "sh0" not in splats or "shN" not in splats:
+            n_train = ckpt.get("n_train_images")
+            if n_train is None:
+                raise ValueError(
+                    f"Checkpoint {ckpt_path} has no 'n_train_images' key. "
+                    "Pass --n_train_images explicitly or re-save the checkpoint."
+                )
+            print(f"  n_train_images={n_train}")
+            
+            embed_dim = ckpt.get("app_embed_dim")
             features.append(splats["features"])   # [N, 32]
             colors_base.append(splats["colors"])  # [N, 3] logit-space base colors
             for key in splats.keys():
@@ -44,9 +55,9 @@ def load_splats(ckpt_paths, device):
             app_state = ckpt["app_module"] if "app_module" in ckpt else None
             print(f"Warning: 'sh0' or 'shN' not found in {ckpt_path}. Using RGB colors instead.")
             app_module = AppearanceOptModule(
-                n=421,     # Must match training!
+                n=n_train,     # Must match training!
                 feature_dim=32,          # Must match training!
-                embed_dim=16,            # Must match training!
+                embed_dim=embed_dim,     # Must match training!
                 sh_degree=3,             # Must match training!
             ).to(device)
             app_module.load_state_dict(ckpt["app_module"])
@@ -57,8 +68,9 @@ def load_splats(ckpt_paths, device):
             app_modules.append(app_module)
             mode = "app"
         else:
-            sh0.append(ckpt["sh0"])
-            shN.append(ckpt["shN"])
+            
+            sh0.append(splats["sh0"])
+            shN.append(splats["shN"])
             print(f"  → SH mode | sh0={splats['sh0'].shape} shN={splats['shN'].shape}")
 
             mode = "sh"
@@ -98,20 +110,20 @@ def render_camera(means, quats, scales, opacities, colors, sh_degree,
         render_colors_eval = torch.sigmoid(render_colors_eval)  # [1, N, 3]
     else:
         render_colors_eval = colors
-    render_colors, render_alphas, info = rasterization(
+    render_out, render_alphas, info = rasterization(
         means, quats, scales, opacities, render_colors_eval,
         viewmat, K_batch,
         width=width, height=height,
         sh_degree=sh_degree,
         near_plane=near,
         far_plane=far,
-        render_mode="RGB",
+        render_mode="RGB+ED",
         packed=False,
     )
     n_rendered = (info["radii"] > 0).all(-1).sum().item()
 
-    rgb   = render_colors[0, ..., :3].clamp(0, 1).cpu().numpy()
-    return rgb, n_rendered
+    render_out[..., :3] = render_out[..., :3].clamp(0, 1)
+    return render_out.cpu().numpy(), n_rendered
 
 
 def save_outputs(output_dir, tag, rgb):
