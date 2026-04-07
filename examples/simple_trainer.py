@@ -104,13 +104,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
@@ -170,6 +170,9 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
+    ####
+    feature_dim: int = 32
+
     # Enable camera optimization.
     pose_opt: bool = False
     # Learning rate for camera optimization
@@ -222,7 +225,6 @@ class Config:
     with_eval3d: bool = False
 
     # 
-    rasterize_mode: Optional[Literal["classic", "antialiased"]] = None
 
     absgrad: bool = False
 
@@ -362,6 +364,7 @@ class Runner:
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
 
+        if cfg.eval_steps
         # Setup output directories.
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
@@ -433,7 +436,7 @@ class Runner:
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
+            feature_dim=cfg.feature_dim,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
@@ -484,7 +487,7 @@ class Runner:
         if cfg.app_opt:
             assert feature_dim is not None
             self.app_module = AppearanceOptModule(
-                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
+                len(self.trainset), cfg.feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
             # initialize the last layer to be zero so that the initial output is zero.
             torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
@@ -950,6 +953,7 @@ class Runner:
                     else:
                         data["app_module"] = self.app_module.state_dict()
                         data["app_embed_dim"] = cfg.app_embed_dim
+                        data["feature_dim"] = cfg.feature_dim
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
                 torch.save(

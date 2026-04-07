@@ -48,6 +48,7 @@ def load_splats(ckpt_paths, device):
             print(f"  n_train_images={n_train}")
             
             embed_dim = ckpt.get("app_embed_dim")
+            feature_dim = ckpt.get("feature_dim")
             features.append(splats["features"])   # [N, 32]
             colors_base.append(splats["colors"])  # [N, 3] logit-space base colors
             for key in splats.keys():
@@ -56,7 +57,7 @@ def load_splats(ckpt_paths, device):
             print(f"Warning: 'sh0' or 'shN' not found in {ckpt_path}. Using RGB colors instead.")
             app_module = AppearanceOptModule(
                 n=n_train,     # Must match training!
-                feature_dim=32,          # Must match training!
+                feature_dim=feature_dim,          # Must match training!
                 embed_dim=embed_dim,     # Must match training!
                 sh_degree=3,             # Must match training!
             ).to(device)

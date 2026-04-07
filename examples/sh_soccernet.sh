@@ -187,6 +187,7 @@ srun python /home/hensemberk/dev/Soccernet/gsplat/examples/simple_trainer.py $DE
     --test_every 0 \
     --colmap_dir $COLMAP_DIR \
     --rasterize_mode $RASTERIZE_MODE \
+    --feature_dim $FEATURE_DIM \
     --disable_viewer \
     \
     --sh_degree 3 \

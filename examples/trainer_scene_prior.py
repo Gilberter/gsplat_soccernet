@@ -56,10 +56,10 @@ from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss 
+from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss, get_depth_lambda_schedule
 
 
-from utils_depth import depth_loss_step
+from utils_depth import depth_loss_step, ScaleAndShiftInvariantLoss
 
 
 @dataclass
@@ -231,12 +231,20 @@ class Config:
     ground_depth_lambda: float = 2.3
     ground_seg_dir: str = ""
     ground_depth_start_step: int = 1000
-    
+
+    ## Strategy depth lambda schedule
+    strategy_depth: Literal["None","progressive","cosine_warmup","exponential"] = "None"
+    depth_loss_to_compute: Literal["SSIL","MSS"] = ["SSIL"]
+    # SFIL Scale and Shift Invariant Loss 
+    # MSS Multi Source Supervision
+
     rasterize_mode: Optional[Literal["classic", "antialiased"]] = None
 
     absgrad: bool = False
 
     mini_depth_dir: str = ""
+
+    feature_dim: int = 32
 
 
     def adjust_steps(self, factor: float):
@@ -448,7 +456,7 @@ class Runner:
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
+            feature_dim=cfg.feature_dim,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
@@ -499,7 +507,7 @@ class Runner:
         if cfg.app_opt:
             assert feature_dim is not None
             self.app_module = AppearanceOptModule(
-                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
+                len(self.trainset), cfg.feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
             # initialize the last layer to be zero so that the initial output is zero.
             torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
@@ -868,22 +876,44 @@ class Runner:
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
 
             if cfg.depth_loss:
-                depthloss, depth_info = depth_loss_step(
-                    depth_rendered = depth_rendered,          # (1, H, W, 1)  from rasterizer
-                    da3_depth      = depth_prior,             # (1, 1, H, W)  raw DA3, NOT permuted
-                    points_px      = points,                  # (1, M, 2)     COLMAP pixels
-                    depths_colmap  = depths_gt,               # (1, M)        COLMAP metric depths
-                    scene_scale    = self.scene_scale,
-                    lambda_sparse  = cfg.depth_lambda,        # e.g. 1e-2  (high trust)
-                    lambda_dense   = cfg.depth_lambda * 0.1,  # e.g. 1e-3  (lower trust)
-                    device         = device,
-                )
-            
-                if torch.isfinite(depthloss) and depthloss.item() > 0:
-                    loss = loss + depthloss
+
+                if cfg.strategy_depth == "None":
+                    lambda_base = cfg.depth_lambda
                 else:
-                    depthloss = torch.tensor(0.0, device=device)
+                    lambda_base = get_depth_lambda_schedule(step=step,max_steps=cfg.max_steps,strategy=cfg.strategy_depth,lambda_base=cfg.depth_lambda)
+
+                if cfg.depth_loss_to_compute == "MSS":
+                    if step == cfg.max_steps * 0.25:
+                        print(lambda_base)
+                    if step == cfg.max_steps * 0.70:
+                        print(lambda_base)
+                    depthloss, depth_info = depth_loss_step(
+                        depth_rendered = depth_rendered,          # (1, H, W, 1)  from rasterizer
+                        da3_depth      = depth_prior,             # (1, 1, H, W)  raw DA3, NOT permuted
+                        points_px      = points,                  # (1, M, 2)     COLMAP pixels
+                        depths_colmap  = depths_gt,               # (1, M)        COLMAP metric depths
+                        scene_scale    = self.scene_scale,
+                        lambda_sparse  = lambda_base,        # e.g. 1e-2  (high trust)
+                        lambda_dense   = lambda_base * 0.1,  # e.g. 1e-3  (lower trust)
+                        device         = device,
+                    )
+                
+                    if torch.isfinite(depthloss) and depthloss.item() > 0:
+                        loss = loss + (depthloss * lambda_base)
+                    else:
+                        depthloss = torch.tensor(0.0, device=device)
+
+                elif cfg.depth_loss_to_compute == "SSIL":
+                    ssi_loss_fn = ScaleAndShiftInvariantLoss(alpha=3.0, scales=4)
+
+                    depthloss = ssi_loss_fn(depth_rendered,depth_prior)
+
+                    if torch.isfinite(depthloss) and depthloss.item() > 0:
+                        loss = loss + depthloss
+                    else:
+                        depthloss = torch.tensor(0.0, device=device)
             
+
             if cfg.ground_depth_loss and ground_masks is not None and step >= cfg.ground_depth_start_step:
                 
                 viewmats_c = torch.linalg.inv(camtoworlds)    # [1, 4, 4]
@@ -1019,6 +1049,7 @@ class Runner:
                     else:
                         data["app_module"] = self.app_module.state_dict()
                         data["app_embed_dim"] = cfg.app_embed_dim
+                        data["feature_dim"] = cfg.feature_dim
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
                 torch.save(

@@ -14,8 +14,11 @@ def create_submission_zip(base_dir, scenes, results_folder, get_renders_dir):
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
 
         for scene in scenes:
-
-            renders_dir = os.path.join(base_dir, scene, results_folder, get_renders_dir)
+            
+            parts = scene.split("-")
+            result = "-".join(parts[:2])
+            new_result_folder = f"{result}-{results_folder}"
+            renders_dir = os.path.join(base_dir, scene, new_result_folder, get_renders_dir)
 
             if not os.path.exists(renders_dir):
                 print(f"Skipping {scene}, {renders_dir} not found")

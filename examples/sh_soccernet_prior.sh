@@ -41,6 +41,8 @@ APP_OPT=${8:-0}          # Default: OFF (memory intensive!)
 MAX_STEPS=${9:-40000}
 PACKED_MODE=${10:-1}     # Default: ON (reduces memory)
 DATA_FACTOR=${11:-1}     # Default: 1 (full resolution)
+DEPTH_MODEL=${12:-"da3metric-large"}
+GROUND_LOSS=${13:-0}
 
 # MORE SETTINGS (tune for best PSNR, but may increase memory):
 
@@ -53,6 +55,8 @@ GROW_GRAD2D=${GROW_GRAD2D:-0.0008}     # Default: 0.0008 (for absgrad)
 BILATERAL_SHAPE_X=${BILATERAL_SHAPE_X:-16}   # Bilateral grid X dimension
 BILATERAL_SHAPE_Y=${BILATERAL_SHAPE_Y:-16}   # Bilateral grid Y dimension
 BILATERAL_SHAPE_W=${BILATERAL_SHAPE_W:-8}    # Bilateral grid color dimension
+GROUND_DIR=/disk/SN-NVS-2026-raw/${SCENE}/mask/masks
+
 
 
 
@@ -86,7 +90,7 @@ FLAGS=""
 [ "$ABSGRAD"        -eq 1 ] && FLAGS="$FLAGS --strategy.absgrad --absgrad"
 [ "$APP_OPT"        -eq 1 ] && FLAGS="$FLAGS --app_opt --app_embed_dim $APP_EMBED_DIM"
 [ "$PACKED_MODE"    -eq 1 ] && FLAGS="$FLAGS --packed"
-
+[ "$GROUND_LOSS"    -eq 1 ] && FLAGS="$FLAGS --ground_depth_loss --ground_seg_dir $GROUND_DIR "
 
 # -------------------------
 # Paths
@@ -96,7 +100,7 @@ DATA_DIR=/disk/SN-NVS-2026-raw/${SCENE}
 RESULT_DIR=/disk/SN-NVS-2026-raw/results-soccernet/${SCENE}-${VERSION}
 COLMAP_DIR=/disk/SN-NVS-2026-raw/${SCENE}/sparse/0
 CHALLENGE_DIR=/disk/SN-NVS-2026-raw/${SCENE}-challenge
-DEPTH_DIR=${DATA_DIR}/${SCENE}-dae3/depth_maps.npz
+DEPTH_DIR=${DATA_DIR}/dae3/${DEPTH_MODEL}/depth_maps.npz
 
 BASE_DIR="$CHALLENGE_DIR/${SCENE}-${VERSION}"
 RESULT_BASE=/disk/SN-NVS-2026-raw/results-soccernet/${SCENE}-${VERSION}
@@ -259,7 +263,7 @@ RESULT_DIR:            $RESULT_DIR
 COLMAP_DIR:            $COLMAP_DIR
 CHALLENGE_DIR:         $CHALLENGE_DIR
 CKPT:                  $CKPT
-
+DEPTH_MODEL: $DEPTH_MODEL
 ================================================================================
 MAIN CONFIGURATION
 ================================================================================

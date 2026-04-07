@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Tuple, Dict
 
-
+import numpy as np
 # =============================================================================
 # SCALE ALIGNMENT — COLMAP anchors DA3
 # =============================================================================
@@ -267,3 +267,51 @@ def depth_loss_step(
         print(f"[depth_loss_step] Error: {e}")
         zero = torch.tensor(0.0, device=device, requires_grad=False)
         return zero, {"loss_sparse": 0., "loss_dense": 0., "aligned": False, "error": str(e)}
+
+
+def compute_scale_and_shift(prediction, target, mask):
+    # system matrix: A = [[a_00, a_01], [a_10, a_11]]
+    a_00 = torch.sum(mask * prediction * prediction, (1, 2))
+    a_01 = torch.sum(mask * prediction, (1, 2))
+    a_11 = torch.sum(mask, (1, 2))
+
+    # right hand side: b = [b_0, b_1]
+    b_0 = torch.sum(mask * prediction * target, (1, 2))
+    b_1 = torch.sum(mask * target, (1, 2))
+
+    # solution: x = A^-1 . b = [[a_11, -a_01], [-a_10, a_00]] / (a_00 * a_11 - a_01 * a_10) . b
+    x_0 = torch.zeros_like(b_0)
+    x_1 = torch.zeros_like(b_1)
+
+    det = a_00 * a_11 - a_01 * a_01
+    valid = det > 0
+
+    x_0[valid] = (a_11[valid] * b_0[valid] - a_01[valid] * b_1[valid]) / det[valid]
+    x_1[valid] = (-a_01[valid] * b_0[valid] + a_00[valid] * b_1[valid]) / det[valid]
+
+    return x_0, x_1
+
+class ScaleAndShiftInvariantLoss(nn.Module):
+    def __init__(self, alpha=3.0, scales=4, reduction='batch-based'):
+        super().__init__()
+
+        self.data_loss = MSELoss(reduction=reduction)
+        self.regularization_loss = GradientLoss(scales=scales, reduction=reduction)
+        self.alpha = alpha
+
+        self.prediction_ssi = None
+
+    def forward(self, prediction, target, mask):
+
+        scale, shift = compute_scale_and_shift(prediction, target, mask)
+
+        self.prediction_ssi = scale.view(-1, 1, 1) * prediction + shift.view(-1, 1, 1)
+
+        total = self.data_loss(self.prediction_ssi, target, mask)
+        if self.alpha > 0:
+            total += self.alpha * self.regularization_loss(self.prediction_ssi, target, mask)
+
+        return total
+
+    def get_prediction_ssi(self):
+        return self.prediction_ssi
