@@ -59,7 +59,7 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss, get_depth_lambda_schedule
 
 
-from utils_depth import depth_loss_step, ScaleAndShiftInvariantLoss
+from utils_depth import depth_loss_step, ScaleAndShiftInvariantLoss,ScaleAndShiftInvariantLossLight
 
 
 @dataclass
@@ -233,8 +233,8 @@ class Config:
     ground_depth_start_step: int = 1000
 
     ## Strategy depth lambda schedule
-    strategy_depth: Literal["None","progressive","cosine_warmup","exponential"] = "None"
-    depth_loss_to_compute: Literal["SSIL","MSS"] = ["SSIL"]
+    strategy_depth: Literal["None","progressive","cosine_warmup","exponential"] = "progressive"
+    depth_loss_to_compute: List[Literal["SSIL", "MSS"]] = field(default_factory=lambda: ["SSIL"])   
     # SFIL Scale and Shift Invariant Loss 
     # MSS Multi Source Supervision
 
@@ -326,7 +326,7 @@ def create_splats_with_optimizers(
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
 
-    if feature_dim is None:
+    if cfg.app_opt == False:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
@@ -437,7 +437,6 @@ class Runner:
             )
 
         # Model
-        feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -505,7 +504,7 @@ class Runner:
 
         self.app_optimizers = []
         if cfg.app_opt:
-            assert feature_dim is not None
+   
             self.app_module = AppearanceOptModule(
                 len(self.trainset), cfg.feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
@@ -627,7 +626,9 @@ class Runner:
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
+        print(image_ids)
         if self.cfg.app_opt:
+            print(f"SHAPE SPLATS FEATURES {self.splats['features'].shape}")
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
@@ -882,7 +883,7 @@ class Runner:
                 else:
                     lambda_base = get_depth_lambda_schedule(step=step,max_steps=cfg.max_steps,strategy=cfg.strategy_depth,lambda_base=cfg.depth_lambda)
 
-                if cfg.depth_loss_to_compute == "MSS":
+                if "MSS" in cfg.depth_loss_to_compute:
                     if step == cfg.max_steps * 0.25:
                         print(lambda_base)
                     if step == cfg.max_steps * 0.70:
@@ -903,10 +904,14 @@ class Runner:
                     else:
                         depthloss = torch.tensor(0.0, device=device)
 
-                elif cfg.depth_loss_to_compute == "SSIL":
-                    ssi_loss_fn = ScaleAndShiftInvariantLoss(alpha=3.0, scales=4)
+                if "SSIL" in cfg.depth_loss_to_compute:
 
-                    depthloss = ssi_loss_fn(depth_rendered,depth_prior)
+                    ssi_loss_fn = ScaleAndShiftInvariantLossLight()
+                    depth_rendered = depth_rendered.permute(0, 3, 1, 2).squeeze(0)
+                    mask = torch.ones_like(depth_rendered)
+                    depth_prior = depth_prior.squeeze(0)
+                    print(f"Shape mask {mask.shape} depth_prior {depth_prior.shape} depth_rendered {depth_rendered.shape}")
+                    depthloss = ssi_loss_fn(depth_rendered,depth_prior,mask)
 
                     if torch.isfinite(depthloss) and depthloss.item() > 0:
                         loss = loss + depthloss
@@ -972,10 +977,10 @@ class Runner:
             if cfg.depth_loss:
                 desc += (
                     f"dep={depthloss.item():.4f}| "
-                    f"spr={depth_info.get('loss_sparse', 0):.4f}| "
-                    f"dns={depth_info.get('loss_dense',  0):.4f}| "
-                    f"s={depth_info.get('da3_scale_s', 1):.2f}| "
-                    f"N={depth_info.get('n_sparse', 0)}"
+                    # f"spr={depth_info.get('loss_sparse', 0):.4f}| "
+                    # f"dns={depth_info.get('loss_dense',  0):.4f}| "
+                    # f"s={depth_info.get('da3_scale_s', 1):.2f}| "
+                    # f"N={depth_info.get('n_sparse', 0)}"
                 )
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
@@ -1001,12 +1006,12 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss",        depthloss.item(),                        step)
-                    self.writer.add_scalar("train/depth_sparse",     depth_info.get("loss_sparse", 0),        step)
-                    self.writer.add_scalar("train/depth_dense",      depth_info.get("loss_dense",  0),        step)
-                    self.writer.add_scalar("train/da3_scale_s",      depth_info.get("da3_scale_s", 1.0),      step)
-                    self.writer.add_scalar("train/da3_shift_t",      depth_info.get("da3_shift_t", 0.0),      step)
-                    self.writer.add_scalar("train/depth_n_sparse",   depth_info.get("n_sparse",    0),        step)
-                    self.writer.add_scalar("train/depth_n_dense",    depth_info.get("n_dense",     0),        step)
+                    # self.writer.add_scalar("train/depth_sparse",     depth_info.get("loss_sparse", 0),        step)
+                    # self.writer.add_scalar("train/depth_dense",      depth_info.get("loss_dense",  0),        step)
+                    # self.writer.add_scalar("train/da3_scale_s",      depth_info.get("da3_scale_s", 1.0),      step)
+                    # self.writer.add_scalar("train/da3_shift_t",      depth_info.get("da3_shift_t", 0.0),      step)
+                    # self.writer.add_scalar("train/depth_n_sparse",   depth_info.get("n_sparse",    0),        step)
+                    # self.writer.add_scalar("train/depth_n_dense",    depth_info.get("n_dense",     0),        step)
 
                 if cfg.post_processing is not None:
                     self.writer.add_scalar(
@@ -1019,7 +1024,12 @@ class Runner:
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
-
+            if step % 500 == 0 and world_rank == 0:
+                if not cfg.app_opt:
+                    print(f"[Debug] SH0 range: [{self.splats['sh0'].min():.4f}, {self.splats['sh0'].max():.4f}]")
+                
+                print(f"[Debug] Render range: [{colors.min():.4f}, {colors.max():.4f}]")
+                print(f"[Debug] Loss breakdown: L1={l1loss:.4f}, SSIM={ssimloss:.4f}")
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1079,6 +1089,7 @@ class Runner:
                 scales = self.splats["scales"]
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
+
                 export_splats(
                     means=means,
                     scales=scales,

@@ -15,6 +15,8 @@ def main(args):
     # --- Load Gaussians ---
     means, quats, scales, opacities, colors, sh_degree, app_module, features = load_splats(args.ckpt, device)
 
+    print(f"means: {means.shape}, opacities range: {opacities.min():.3f} - {opacities.max():.3f}")
+    print(f"colors range: {colors.min():.3f} - {colors.max():.3f}")
     
 
     if sh_degree is not None:
@@ -39,7 +41,13 @@ def main(args):
 
     print(f"Rendering {len(indices)} {args.data_dir}")
 
-    
+    if args.specific:
+        output_dir = args.result_folder
+    else:
+        output_dir = os.path.join(args.data_dir, args.result_folder)
+
+    os.makedirs(output_dir, exist_ok=True)
+
     path_renders = sorted(os.listdir(f"{args.data_dir}/renders"))
 
     for i, idx in enumerate(indices):
@@ -60,18 +68,18 @@ def main(args):
             device=device, app_module=app_module, features=features
         )
 
-        print(f" SHAPE render_out {render_out.shape}")
+        #print(f" SHAPE render_out {render_out.shape}")
 
-        print(f" SHAPE render_out {render_out.max()}")
+        #print(f" SHAPE render_out {render_out.max()}")
 
 
         if isinstance(render_out, torch.Tensor):
-            print("Tensor")
+            # print("Tensor")
             render_out = render_out.detach().cpu().numpy()
 
         # Shape guard: must be (H, W, 3)
         if render_out.ndim == 4:
-            print(f"fOR DIM")
+            # print(f"fOR DIM")
             render_out = render_out.squeeze(0)          # remove batch dim if present
  
         if render_out.shape[-1] > 3:
@@ -86,11 +94,9 @@ def main(args):
             f"render_out has unexpected shape after fix: {render_out.shape}"
 
         
-        # if render_out.dtype != np.uint8:
+        # if render_out.dtype != np.uint8 and render_out.max() < 1: 
         #     render_out = np.clip(render_out * 255.0, 0, 255).astype(np.uint8)
 
-        # if render_out.max() > 255:
-        #     render_out = render_out / (render_out.max() + 1e-8)
 
         left_image = render_out.copy()   # (H, W, 3) uint8
         tag  = f"{i:05d}"
@@ -104,26 +110,20 @@ def main(args):
         print(f" SHAPE img_rendered_right {img_rendered_right.max()}")
         print(f" SHAPE render_out {render_out.max()}")
         
-        if args.specific:
-            output_dir = args.result_folder
-
-        else:
-            output_dir = os.path.join(args.data_dir, args.result_folder)
-
         
-
+        print(f"OUTPUT DIR {output_dir}")
         save_outputs(output_dir, tag, left_image)
         save_outputs_canvas(output_dir, left_image, img_rendered_right, tag)
 
-        for ckpt_path in args.ckpt:
-            filename = os.path.basename(ckpt_path)
-            dst_path = os.path.join(output_dir, filename)
-
-            if not os.path.exists(dst_path):
-                shutil.copy2(ckpt_path, dst_path)
-
         print(f"  [{i+1}/{len(indices)}] | {width}x{height} | rendered {n} Gaussians")
         print(f"\nDone. Scene {args.data_dir} in: {args.result_folder if args.result_folder != '' else 'Same input folder'}")
+    
+    for ckpt_path in args.ckpt:
+        filename = os.path.basename(ckpt_path)
+        dst_path = os.path.join(output_dir, filename)
+        if not os.path.exists(dst_path):
+            shutil.copy2(ckpt_path, dst_path)
+            print(f"  Checkpoint copied → {dst_path}")
     print(f"\nDone. Outputs")
 
 

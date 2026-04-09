@@ -17,7 +17,8 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from gsplat.rendering import rasterization
-
+import imageio.v3 as iio
+from tqdm import tqdm
 from scipy.spatial.transform import Rotation as qua2rot
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
@@ -25,67 +26,95 @@ import PIL
 
 import cv2
 def load_splats(ckpt_paths, device):
-    means, quats, scales, opacities, sh0, shN = [], [], [], [], [], []
-    app_modules,features,colors_base = [],[],[] # WHEN TRAINED WHEN APPMODULE
+    means, quats, scales, opacities = [], [], [], []
+    sh0, shN = [], []
+
+    app_modules, features, colors_base = [],[],[] # WHEN TRAINED WHEN APPMODULE
+    
     mode = None
+
     for ckpt_path in ckpt_paths:
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         splats = ckpt["splats"]
         
         means.append(splats["means"])
         quats.append(F.normalize(splats["quats"], p=2, dim=-1))
         scales.append(torch.exp(splats["scales"]))
         opacities.append(torch.sigmoid(splats["opacities"]))
+
+        # Check which mode (app_opt or sh_opt)
+        has_sh = "sh0" in splats and "shN" in splats
+        has_app = "features" in splats and "colors" in splats
         
-      
-        if "sh0" not in splats or "shN" not in splats:
+        if has_app and "app_module" in ckpt:
             n_train = ckpt.get("n_train_images")
             if n_train is None:
-                raise ValueError(
-                    f"Checkpoint {ckpt_path} has no 'n_train_images' key. "
-                    "Pass --n_train_images explicitly or re-save the checkpoint."
-                )
-            print(f"  n_train_images={n_train}")
+                raise ValueError(f"Checkpoint {ckpt_path} missing 'n_train_images'")
             
-            embed_dim = ckpt.get("app_embed_dim")
-            feature_dim = ckpt.get("feature_dim")
-            features.append(splats["features"])   # [N, 32]
-            colors_base.append(splats["colors"])  # [N, 3] logit-space base colors
+            embed_dim = ckpt.get("app_embed_dim", 32)
+            feature_dim = ckpt.get("feature_dim", 32)
+
+            features.append(splats["features"])
+
+            base_colors = splats["colors"]
+            base_colors_safe = torch.clamp(base_colors, min=-10, max=10)
+            colors_base.append(base_colors)
+
             for key in splats.keys():
                 print(f"  - {key}: {splats[key].shape}")
-            app_state = ckpt["app_module"] if "app_module" in ckpt else None
-            print(f"Warning: 'sh0' or 'shN' not found in {ckpt_path}. Using RGB colors instead.")
-            app_module = AppearanceOptModule(
-                n=n_train,     # Must match training!
-                feature_dim=feature_dim,          # Must match training!
-                embed_dim=embed_dim,     # Must match training!
-                sh_degree=3,             # Must match training!
-            ).to(device)
-            app_module.load_state_dict(ckpt["app_module"])
-            print(f"✓ Found app_module state_dict with keys")
-            print(f"  → App mode | features={splats['features'].shape} {splats['colors'].shape} | app_module loaded ✓")
 
-            app_module.eval()  # Set to evaluation mode
+            if torch.isinf(base_colors).any() or torch.isnan(base_colors).any():
+                print(f"⚠️  WARNING: Found inf/nan in base colors")
+                print(f"   Before clamp: [{base_colors.min():.3f}, {base_colors.max():.3f}]")
+                print(f"   After clamp:  [{base_colors_safe.min():.3f}, {base_colors_safe.max():.3f}]")
+
+
+            app_module = AppearanceOptModule(
+                n=n_train,
+                feature_dim=feature_dim,
+                embed_dim=embed_dim,
+                sh_degree=3,
+            ).to(device)
+
+            app_module.load_state_dict(ckpt["app_module"])
+            app_module.eval()
             app_modules.append(app_module)
+
+
+            print(f"App module type: {type(app_module)}")
+            print(f"✓ App mode | features={splats['features'].shape} colors={splats['colors'].shape}")
             mode = "app"
-        else:
-            
+        elif has_sh:
+            # "Spherical Mode"
             sh0.append(splats["sh0"])
             shN.append(splats["shN"])
-            print(f"  → SH mode | sh0={splats['sh0'].shape} shN={splats['shN'].shape}")
-
+            print(f"✓ SH mode | sh0={splats['sh0'].shape} shN={splats['shN'].shape}")
             mode = "sh"
+        else:
+            raise ValueError(f"Unknown mode in {ckpt_path}")
+
     means     = torch.cat(means, dim=0)
     quats     = torch.cat(quats, dim=0)
     scales    = torch.cat(scales, dim=0)
     opacities = torch.cat(opacities, dim=0)
     if mode == "app":
-        features  = torch.cat(features, dim=0)
+        features = torch.cat(features, dim=0)
         colors = torch.cat(colors_base, dim=0)
         sh_degree = None
+        print(f"List App Modules {app_modules}")
+        app_module = app_modules[0] 
+        print(f"List 2 App Modules {app_module}")
+
+
+        sh_degree = None
     if mode == "sh":
-        colors    = torch.cat([torch.cat(sh0, dim=0), torch.cat(shN, dim=0)], dim=-2)
-        sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
+        sh0 = torch.cat(sh0, dim=0)
+        shN = torch.cat(shN, dim=0)
+        colors = torch.cat([sh0, shN], dim=1)  # [N, K, 3]
+        sh_degree = 3
+        app_module = None
+        features = None
+
     print(f"Loaded {len(means)} Gaussians | sh_degree={sh_degree}")
     return means, quats, scales, opacities, colors, sh_degree, app_modules[0] if mode == "app" else None, features if mode == "app" else None
 
@@ -99,20 +128,108 @@ def render_camera(means, quats, scales, opacities, colors, sh_degree,
     K_batch = K.unsqueeze(0)              # [1, 3, 3]
 
     if app_module is not None and features is not None:
-        # ── App mode: evaluate MLP with neutral (zero) embedding ──────────
-        dirs = means[None, :, :] - c2w[None, :3, 3]   # [1, N, 3]
-        render_colors_eval = app_module(
-            features  = features,
-            embed_ids = None,      # None → zero embedding (novel / neutral view)
-            dirs      = dirs,
-            sh_degree = 3,
-        )
-        render_colors_eval = render_colors_eval + colors   # residual
-        render_colors_eval = torch.sigmoid(render_colors_eval)  # [1, N, 3]
+        print(f"\n{'─'*80}")
+        print(f"📊 APPEARANCE OPTIMIZATION PATH")
+        print(f"{'─'*80}")
+        
+        # Check shapes match
+        N_means = means.shape[0]
+        N_features = features.shape[0]
+        N_colors = colors.shape[0]
+        
+        print(f"Shape compatibility check:")
+        print(f"  N (means):    {N_means}")
+        print(f"  N (features): {N_features}")
+        print(f"  N (colors):   {N_colors}")
+        
+        if N_features != N_colors:
+            print(f"❌ ERROR: features ({N_features}) != colors ({N_colors})")
+            print(f"   This usually means multiple checkpoints were concatenated")
+            print(f"   App module can only be used with single checkpoint!")
+            raise RuntimeError(
+                f"Appearance module shape mismatch: "
+                f"features={N_features} but colors={N_colors}"
+            )
+        
+        # Compute view directions
+        dirs = means[None, :, :] - c2w[None, :3, 3]  # [1, N, 3]
+        print(f"\nView directions:")
+        print(f"  dirs shape:  {dirs.shape}")
+        print(f"  dirs range:  [{dirs.min():.3f}, {dirs.max():.3f}]")
+        
+        # Get color delta from network
+        print(f"\nCalling app_module...")
+        print(f"  features:    {features.shape}")
+        print(f"  embed_ids:   None (zero embedding)")
+        print(f"  dirs:        {dirs.shape}")
+        print(f"  sh_degree:   3")
+        
+        color_delta = app_module(
+            features=features,
+            embed_ids=None,      # Zero embedding for neutral view
+            dirs=dirs,
+            sh_degree=3,
+        )  # Expected: [1, N, 3]
+        
+        print(f"\nNetwork output:")
+        print(f"  color_delta shape:  {color_delta.shape}")
+        print(f"  color_delta range:  [{color_delta.min():.3f}, {color_delta.max():.3f}]")
+        print(f"  color_delta finite: {torch.isfinite(color_delta).all()}")
+        
+        # ✅ Clamp base colors to prevent inf/nan
+        colors_safe = torch.clamp(colors, min=-10, max=10)
+        
+        print(f"\nBase colors (logit space):")
+        print(f"  colors orig shape:   {colors.shape}")
+        print(f"  colors orig range:   [{colors.min():.3f}, {colors.max():.3f}]")
+        print(f"  colors has inf:      {torch.isinf(colors).any()}")
+        print(f"  colors has nan:      {torch.isnan(colors).any()}")
+        print(f"  colors_safe range:   [{colors_safe.min():.3f}, {colors_safe.max():.3f}]")
+        
+        # ✅ Squeeze color_delta to match colors shape
+        color_delta_squeezed = color_delta.squeeze(0)  # [1, N, 3] → [N, 3]
+        
+        print(f"\nColor delta after squeeze:")
+        print(f"  shape:  {color_delta_squeezed.shape}")
+        print(f"  range:  [{color_delta_squeezed.min():.3f}, {color_delta_squeezed.max():.3f}]")
+        
+        # ✅ Combine: delta + base color (logit space)
+        print(f"\nCombining colors:")
+        # print(f"  color_delta_squeezed:  {color_delta_squeezed.shape}")
+        print(f"  colors_safe:           {colors_safe.shape}")
+        
+        colors_combined = color_delta_squeezed + colors_safe
+        
+        print(f"  colors_combined (before clamp):")
+        print(f"    shape:   {colors_combined.shape}")
+        print(f"    range:   [{colors_combined.min():.3f}, {colors_combined.max():.3f}]")
+        print(f"    has inf: {torch.isinf(colors_combined).any()}")
+        print(f"    has nan: {torch.isnan(colors_combined).any()}")
+        
+        # ✅ Clamp to prevent extreme values
+        colors_combined = torch.clamp(colors_combined, min=-10, max=10)
+        
+        print(f"  colors_combined (after clamp):")
+        print(f"    range:   [{colors_combined.min():.3f}, {colors_combined.max():.3f}]")
+        
+        # ✅ Apply sigmoid
+        colors_final = torch.sigmoid(colors_combined)
+
+        # ✅ Replace any NaN with neutral gray
+        nan_mask = ~torch.isfinite(colors_final)
+        if nan_mask.any():
+            num_nans = nan_mask.sum().item()
+            print(f"⚠️  WARNING: Found {num_nans} NaN/Inf values in final colors")
+            colors_final[nan_mask] = 0.5  # Neutral gray
+            print(f"   Replaced with 0.5 (neutral gray)")
     else:
-        render_colors_eval = colors
+        colors_final  = colors
+        print(f"  colors orig shape:   {colors.shape}")
+        print(f"SH DEGREE{sh_degree}")
+        print(f"    range SH:   [{colors.min():.3f}, {colors.max():.3f}]")
+
     render_out, render_alphas, info = rasterization(
-        means, quats, scales, opacities, render_colors_eval,
+        means, quats, scales, opacities, colors_final,
         viewmat, K_batch,
         width=width, height=height,
         sh_degree=sh_degree,
@@ -122,7 +239,7 @@ def render_camera(means, quats, scales, opacities, colors, sh_degree,
         packed=False,
     )
     n_rendered = (info["radii"] > 0).all(-1).sum().item()
-
+    print(f"    range n_rendered:   [{render_out.min():.3f}, {render_out.max():.3f}]")
     render_out[..., :3] = render_out[..., :3].clamp(0, 1)
     return render_out.cpu().numpy(), n_rendered
 

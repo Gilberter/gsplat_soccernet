@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=gsplat_experiment
+#SBATCH --job-name=soccernet
 #SBATCH --output=./logs/train_%j.out
 #SBATCH --account=gs_hyperspectral
 #SBATCH --error=./logs/error_%j.log
 #SBATCH --cpus-per-task=10
 #SBATCH --partition=gpu
-#SBATCH --mem=25G
+#SBATCH --mem=20G
 #SBATCH --time 02:00:00
 
 ################################################################################
@@ -59,7 +59,7 @@ print_info() {
 }
 
 print_error() {
-    echo -e "${RED}��${NC} $1"
+    echo -e "${RED}✗${NC} $1"
 }
 
 print_warning() {
@@ -80,7 +80,7 @@ if [ $# -lt 2 ]; then
     echo "  --absgrad               Enable absolute gradients"
     echo "  --antialiased           Enable antialiased rasterization"
     echo "  --app-opt               Enable appearance optimization"
-    echo "  --post-proccesing {bilateral_grid,ppisp}      Enable bilateral grid post-processing"
+    echo "  --post-processing {bilateral_grid,ppisp}      Enable bilateral grid post-processing"
     echo "  --data-factor N         Downsample factor (default: 1)"
     echo "  --max-steps N           Max steps (default: 40000)"
     echo "  --colmap-dir PATH       Path to COLMAP sparse folder"
@@ -116,9 +116,10 @@ DATA_FACTOR=2
 MAX_STEPS=40000
 OPACITY_REG=0.01
 SCALE_REG=0.01
-APP_EMBED_DIM=16
+APP_EMBED_DIM=64
 FEATURE_DIM=32
 GROW_GRAD2D=0.0008
+SSIM_LAMBDA=0.2
 
 # Bilateral grid parameters
 BILATERAL_SHAPE_X=16
@@ -160,6 +161,10 @@ while [[ $# -gt 0 ]]; do
             DATA_FACTOR=$2
             shift 2
             ;;
+        --ssim-lambda)
+            SSIM_LAMBDA=$2
+            shift 2
+            ;;
         --max-steps)
             MAX_STEPS=$2
             shift 2
@@ -179,6 +184,29 @@ while [[ $# -gt 0 ]]; do
         --colmap-dir)
             COLMAP_DIR=$2
             shift 2
+            ;;
+        --feature-dim)
+            FEATURE_DIM=$2
+            shift 2
+            ;;
+        --app-embed-dim)
+            APP_EMBED_DIM=$2
+            shift 2
+            ;;
+
+        --grow-grad2d)
+            GROW_GRAD2D=$2
+            shift 2
+            ;;
+        --packed)
+            PACKED=true
+            shift
+            ;;
+        --bilateral-shape)
+            BILATERAL_SHAPE_X=$2
+            BILATERAL_SHAPE_Y=$3
+            BILATERAL_SHAPE_W=$4
+            shift 4
             ;;
         *)
             print_warning "Unknown flag: $1"
@@ -215,6 +243,10 @@ if [ "$BILATERAL" = true ]; then
     FEATURES+=("bilateral")
 fi
 
+if [ "$PACKED" = true ]; then
+    FEATURES+=("packed")
+fi
+
 
 # If no features, use baseline
 if [ ${#FEATURES[@]} -eq 0 ]; then
@@ -229,24 +261,58 @@ if [ "$MAX_STEPS" != "40000" ]; then
     CONFIG_SUFFIX="${CONFIG_SUFFIX}_s${MAX_STEPS}"
 fi
 
-# Final result directory structure
-RESULT_BASE_DIR="/disk/SN-NVS-2026-raw/results-soccernet/${SCENE}/${DENSIFICATION}/${FEATURE_NAME}${CONFIG_SUFFIX}"
+# ============================================================================
+# DIRECTORIES
+# ============================================================================
+#
+# RESULT_DIR  → temporary folder used only during training to hold the
+#               checkpoint produced by simple_trainer.py.  It is deleted
+#               after a successful eval so that storage is not wasted.
+#
+# OUTPUT_DIR  → permanent folder inside CHALLENGE_DIR where eval_challenge.py
+#               writes its outputs.  The checkpoint is also copied here so
+#               everything (ckpt + eval artefacts + logs) lives in one place.
+#
+# ============================================================================
+
 OUTPUT_BASE_DIR="${CHALLENGE_DIR}/${SCENE}/${DENSIFICATION}/${FEATURE_NAME}${CONFIG_SUFFIX}"
 
 # Handle multiple runs (run1, run2, etc.)
-if [ -d "$RESULT_BASE_DIR" ]; then
+if [ -d "$OUTPUT_BASE_DIR" ]; then
     i=1
-    while [ -d "${RESULT_BASE_DIR}_run${i}" ]; do
+    while [ -d "${OUTPUT_BASE_DIR}_run${i}" ]; do
         ((i++))
     done
-    RESULT_DIR="${RESULT_BASE_DIR}_run${i}"
     OUTPUT_DIR="${OUTPUT_BASE_DIR}_run${i}"
     RUN_NUM=$i
 else
-    RESULT_DIR="$RESULT_BASE_DIR"
     OUTPUT_DIR="$OUTPUT_BASE_DIR"
     RUN_NUM=0
 fi
+
+# Temporary training directory – lives in /tmp and is cleaned up after eval
+RESULT_DIR="/tmp/gsplat_train_${SCENE}_${DENSIFICATION}_${FEATURE_NAME}${CONFIG_SUFFIX}_run${RUN_NUM}"
+
+cleanup_on_failure() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo "----------------------------------------------------"
+        case $exit_code in
+            1)   echo "❌ ERROR 1: General error or Python Crash (Import/Logic)" ;;
+            130) echo "❌ ERROR 130: Script terminated by User (Ctrl+C)" ;;
+            137) echo "❌ ERROR 137: Out of Memory (OOM) - Job killed by Slurm" ;;
+            139) echo "❌ ERROR 139: Segmentation Fault (C++/CUDA core error)" ;;
+            *)   echo "❌ ERROR $exit_code: Unknown crash" ;;
+        esac
+
+        echo "⚠️ Cleaning up folders..."
+        [ -d "$RESULT_DIR" ] && rm -rf "$RESULT_DIR" && echo "🗑️ Deleted temp dir: $RESULT_DIR"
+        [ -d "$OUTPUT_DIR" ] && rm -rf "$OUTPUT_DIR"  && echo "🗑️ Deleted output dir: $OUTPUT_DIR"
+        echo "----------------------------------------------------"
+    fi
+}
+
+trap cleanup_on_failure EXIT
 
 mkdir -p "$RESULT_DIR"
 mkdir -p "$OUTPUT_DIR"
@@ -256,33 +322,37 @@ mkdir -p ./logs
 # LOG CONFIGURATION
 # ============================================================================
 
-LOG_FILE="$RESULT_DIR/experiment_log.txt"
-CONFIG_FILE="$RESULT_DIR/config.txt"
+# Logs are written to OUTPUT_DIR so they end up in the permanent location
+LOG_FILE="$OUTPUT_DIR/experiment_log.txt"
+CONFIG_FILE="$OUTPUT_DIR/config.txt"
 
 {
     print_header "EXPERIMENT CONFIGURATION"
-    
+
     echo ""
     echo "📋 EXPERIMENT IDENTITY"
     printf "%-30s %s\n" "Scene:" "$SCENE"
     printf "%-30s %s\n" "Densification:" "$DENSIFICATION"
     printf "%-30s %s\n" "Feature Set:" "$FEATURE_NAME"
     printf "%-30s %s\n" "Run Number:" "$RUN_NUM"
-    
+
     echo ""
     echo "🔧 TRAINING PARAMETERS"
     printf "%-30s %s\n" "Max Steps:" "$MAX_STEPS"
     printf "%-30s %s\n" "Data Factor:" "$DATA_FACTOR"
     printf "%-30s %s\n" "Batch Size:" "1"
     printf "%-30s %s\n" "SH Degree:" "3"
-    
+    printf "%-30s %s\n" "PACKED:" "$PACKED"
+    printf "%-30s %s\n" "SSIM_LAMBDA:" "$SSIM_LAMBDA"
+
+
     echo ""
     echo "🎯 FEATURES ENABLED"
-    [ "$ABSGRAD" = true ] && printf "%-30s %s\n" "Absgrad:" "✓ ON" || printf "%-30s %s\n" "Absgrad:" "✗ OFF"
-    [ "$ANTIALIASED" = true ] && printf "%-30s %s\n" "Antialiased:" "✓ ON" || printf "%-30s %s\n" "Antialiased:" "✗ OFF"
-    [ "$APP_OPT" = true ] && printf "%-30s %s\n" "App Opt:" "✓ ON" || printf "%-30s %s\n" "App Opt:" "✗ OFF"
-    [ "$BILATERAL" = true ] && printf "%-30s %s\n" "Bilateral Grid:" "✓ ON" || printf "%-30s %s\n" "Bilateral Grid:" "✗ OFF"
-    [ "$PPISP" = true ] && printf "%-30s %s\n" "PPISP:" "✓ ON" || printf "%-30s %s\n" "PPISP:" "✗ OFF"
+    [ "$ABSGRAD" = true ]     && printf "%-30s %s\n" "Absgrad:"       "✓ ON" || printf "%-30s %s\n" "Absgrad:"       "✗ OFF"
+    [ "$ANTIALIASED" = true ] && printf "%-30s %s\n" "Antialiased:"   "✓ ON" || printf "%-30s %s\n" "Antialiased:"   "✗ OFF"
+    [ "$APP_OPT" = true ]     && printf "%-30s %s\n" "App Opt:"       "✓ ON" || printf "%-30s %s\n" "App Opt:"       "✗ OFF"
+    [ "$BILATERAL" = true ]   && printf "%-30s %s\n" "Bilateral Grid:" "✓ ON" || printf "%-30s %s\n" "Bilateral Grid:" "✗ OFF"
+    [ "$PPISP" = true ]       && printf "%-30s %s\n" "PPISP:"         "✓ ON" || printf "%-30s %s\n" "PPISP:"         "✗ OFF"
 
     echo ""
     echo "📊 HYPERPARAMETERS"
@@ -290,24 +360,23 @@ CONFIG_FILE="$RESULT_DIR/config.txt"
     printf "%-30s %s\n" "Scale Reg:" "$SCALE_REG"
     printf "%-30s %s\n" "Feature Dim:" "$FEATURE_DIM"
     printf "%-30s %s\n" "App Embed Dim:" "$APP_EMBED_DIM"
-    [ "$ABSGRAD" = true ] && printf "%-30s %s\n" "Grow Grad2D:" "$GROW_GRAD2D"
+    [ "$ABSGRAD" = true ]   && printf "%-30s %s\n" "Grow Grad2D:" "$GROW_GRAD2D"
     [ "$BILATERAL" = true ] && printf "%-30s %s\n" "Bilateral Grid Shape:" "($BILATERAL_SHAPE_X, $BILATERAL_SHAPE_Y, $BILATERAL_SHAPE_W)"
-    [ "$PPISP" = true ] && printf "%-30s %s\n" "PPISP:" "✓ ON" || printf "%-30s %s\n" "PPISP:" "✗ OFF"
+    [ "$PPISP" = true ]     && printf "%-30s %s\n" "PPISP:" "✓ ON" || printf "%-30s %s\n" "PPISP:" "✗ OFF"
 
     echo ""
     echo "📂 PATHS"
     printf "%-30s %s\n" "Data Directory:" "$DATA_DIR"
     printf "%-30s %s\n" "COLMAP Directory:" "$COLMAP_DIR"
-    printf "%-30s %s\n" "Result Directory:" "$RESULT_DIR"
+    printf "%-30s %s\n" "Temp Train Directory:" "$RESULT_DIR"
     printf "%-30s %s\n" "Output Directory:" "$OUTPUT_DIR"
-    
+
     echo ""
     echo "⏱️ TIMING"
     printf "%-30s %s\n" "Start Time:" "$(date '+%Y-%m-%d %H:%M:%S')"
-    
+
 } | tee "$LOG_FILE"
 
-# Also save config in simple format
 cp "$LOG_FILE" "$CONFIG_FILE"
 
 print_info "Configuration logged to: $LOG_FILE"
@@ -316,13 +385,14 @@ print_info "Configuration logged to: $LOG_FILE"
 # BUILD TRAINING FLAGS
 # ============================================================================
 
-FLAGS="--packed"
+FLAGS=""
 FLAGS="$FLAGS --disable_viewer"
 FLAGS="$FLAGS --data_factor $DATA_FACTOR"
 FLAGS="$FLAGS --opacity_reg $OPACITY_REG"
 FLAGS="$FLAGS --scale_reg $SCALE_REG"
 FLAGS="$FLAGS --feature_dim $FEATURE_DIM"
 FLAGS="$FLAGS --max_steps $MAX_STEPS"
+FLAGS="$FLAGS --ssim_lambda $SSIM_LAMBDA"
 
 # Add conditional flags
 if [ "$ABSGRAD" = true ]; then
@@ -352,12 +422,8 @@ fi
 
 if [ "$DENSIFICATION" = "mcmc" ]; then
     DENSIFICATION_CMD="mcmc"
-    INIT_OPA="0.5"
-    INIT_SCALE="0.1"
 else
     DENSIFICATION_CMD="default"
-    INIT_OPA="0.1"
-    INIT_SCALE="1.0"
 fi
 
 # ============================================================================
@@ -368,6 +434,8 @@ print_header "GPU ENVIRONMENT CHECK"
 
 source /opt/miniforge3/etc/profile.d/conda.sh
 conda activate soccernet
+
+export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
 
 srun python3 -c "
 import torch
@@ -386,7 +454,7 @@ print_header "STARTING TRAINING"
 print_info "Scene: $SCENE"
 print_info "Densification: $DENSIFICATION"
 print_info "Features: $FEATURE_NAME"
-print_info "Output: $RESULT_DIR"
+print_info "Temp output: $RESULT_DIR"
 
 START_TIME=$(date +%s)
 
@@ -394,8 +462,6 @@ srun python "$REPO_ROOT/examples/simple_trainer.py" "$DENSIFICATION_CMD" \
     --data_dir "$DATA_DIR" \
     --result_dir "$RESULT_DIR" \
     --colmap_dir "$COLMAP_DIR" \
-    --init_opa "$INIT_OPA" \
-    --init_scale "$INIT_SCALE" \
     --no-normalize_world_space \
     --no-load_exposure \
     --test_every 0 \
@@ -407,36 +473,47 @@ END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
 # ============================================================================
-# POST-TRAINING
+# POST-TRAINING: EVAL + COPY CKPT + CLEANUP TEMP DIR
 # ============================================================================
 
 print_header "TRAINING COMPLETED"
 print_info "Duration: $((DURATION / 60)) minutes ($DURATION seconds)"
-print_info "Results saved to: $RESULT_DIR"
 
-# Get checkpoint
 CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt"
 
 if [ -f "$CKPT" ]; then
     print_info "Checkpoint found: $(basename $CKPT)"
-    
-    # Run evaluation
+
+    # ── 1. Run evaluation (outputs go to OUTPUT_DIR inside CHALLENGE_DIR) ──
     print_header "RUNNING EVALUATION"
-    
+
     srun python "$REPO_ROOT/examples/eval_challenge.py" \
         --ckpt "$CKPT" \
         --data_dir "$CHALLENGE_DIR" \
-        --result_folder "$(basename $OUTPUT_DIR)" \
+        --result_folder "$OUTPUT_DIR" \
+        --specific \
         2>&1 | tee -a "$LOG_FILE"
+
+    # ── 2. Copy the checkpoint into OUTPUT_DIR so everything is together ──
+    CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
+    mkdir -p "$CKPT_DEST_DIR"
+    cp "$CKPT" "$CKPT_DEST_DIR/"
+    print_info "Checkpoint copied to: $CKPT_DEST_DIR/$(basename $CKPT)"
+
+    # ── 3. Delete the temporary training directory ──
+    rm -rf "$RESULT_DIR"
+    print_info "Temp training directory removed: $RESULT_DIR"
+
 else
     print_warning "Checkpoint not found at: $CKPT"
+    print_warning "Skipping eval and temp-dir cleanup."
 fi
 
 # ============================================================================
-# GENERATE SUMMARY
+# GENERATE SUMMARY  (saved to OUTPUT_DIR alongside logs + ckpt)
 # ============================================================================
 
-SUMMARY_FILE="$RESULT_DIR/SUMMARY.md"
+SUMMARY_FILE="$OUTPUT_DIR/SUMMARY.md"
 
 cat > "$SUMMARY_FILE" << EOF
 # Experiment Summary
@@ -464,13 +541,13 @@ cat > "$SUMMARY_FILE" << EOF
 - **Start Time**: $(date -d @$START_TIME '+%Y-%m-%d %H:%M:%S')
 - **End Time**: $(date '+%Y-%m-%d %H:%M:%S')
 - **Duration**: $((DURATION / 60)) minutes
-- **Result Dir**: $RESULT_DIR
-- **Checkpoint**: $CKPT
+- **Output Dir**: $OUTPUT_DIR
+- **Checkpoint**: $CKPT_DEST_DIR/$(basename $CKPT)
 
 ## Paths
 - Data: $DATA_DIR
 - COLMAP: $COLMAP_DIR
-- Output: $OUTPUT_DIR
+- Challenge: $CHALLENGE_DIR
 EOF
 
 print_info "Summary saved to: $SUMMARY_FILE"

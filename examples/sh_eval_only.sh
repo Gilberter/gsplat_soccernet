@@ -33,24 +33,25 @@ if torch.cuda.is_available():
 print(f'Arch list: {torch.cuda.get_arch_list()}')
 "
 
+# scene-2-challenge/scene-2/mcmc/antialiased_appopt_s100000/ckpt_99999_rank0.pt
 SCENE=$1
 VERSION=$2
 CKPT_RANK=${3:-290000}  # Default checkpoint rank to evaluate
 
-VERSION_NAME=$(basename "$VERSION")
-echo "$VERSION_NAME"
+
 
 CHALLENGE_DIR="/disk/SN-NVS-2026-raw/${SCENE}-challenge"
-CKPT_DIR="/disk/SN-NVS-2026-raw/results-soccernet/${VERSION_NAME}/ckpts/ckpt_${CKPT_RANK}_rank0.pt"
+CKPT_DIR="/disk/SN-NVS-2026-raw/${VERSION}"
 RESULT_DIR=""
 
-RESULT_BASE_DIR="${CHALLENGE_DIR}/${VERSION_NAME}"
+CKPT_DIR="/disk/SN-NVS-2026-raw/${VERSION}"
 
-if [ -d "$RESULT_BASE_DIR" ]; then
-    RESULT_DIR=${RESULT_BASE_DIR}/results-${CKPT_RANK}
-else
-    RESULT_DIR="${CHALLENGE_DIR}/${VERSION_NAME}"
-fi
+# Get run directory (remove /ckpts/ckpt_xxx.pt)
+RUN_DIR=$(dirname $(dirname "$CKPT_DIR"))
+
+RESULT_DIR="$RUN_DIR/results-${CKPT_RANK}"
+
+
 
 echo "Target Result Folder: $RESULT_DIR"
 echo "Target Checkpoint: $CKPT_DIR"

@@ -114,6 +114,19 @@ else
     OUTPUT_DIR="$BASE_DIR"
 fi
 
+cleanup_on_failure() {
+    local exit_code=$?
+    # If the exit code is NOT 0 (meaning it crashed)
+    if [ $exit_code -ne 0 ]; then
+        echo "❌ Script failed with exit code $exit_code. Cleaning up folders..."
+        [ -d "$RESULT_DIR" ] && rm -rf "$RESULT_DIR"
+        [ -d "$OUTPUT_DIR" ] && rm -rf "$OUTPUT_DIR"
+        echo "🗑️ Deleted: $RESULT_DIR and $OUTPUT_DIR"
+    fi
+}
+
+trap cleanup_on_failure EXIT
+
 mkdir -p "$RESULT_DIR"
 
 mkdir -p "$OUTPUT_DIR"

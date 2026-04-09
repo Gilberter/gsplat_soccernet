@@ -171,7 +171,7 @@ class Config:
     scale_reg: float = 0.0
 
     ####
-    feature_dim: int = 32
+    feature_dim: int = 64
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -308,13 +308,14 @@ def create_splats_with_optimizers(
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
 
-    if feature_dim is None:
+    if cfg.app_opt == False:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
     else:
+        print("Sanity Check Feature DIM On")
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
@@ -364,7 +365,7 @@ class Runner:
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
 
-        if cfg.eval_steps
+    
         # Setup output directories.
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
@@ -417,7 +418,6 @@ class Runner:
             )
 
         # Model
-        feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -485,10 +485,11 @@ class Runner:
 
         self.app_optimizers = []
         if cfg.app_opt:
-            assert feature_dim is not None
+            
             self.app_module = AppearanceOptModule(
                 len(self.trainset), cfg.feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
+            print(f"Sanity Check feature dim {cfg.feature_dim}")
             # initialize the last layer to be zero so that the initial output is zero.
             torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
             torch.nn.init.zeros_(self.app_module.color_head[-1].bias)
@@ -605,8 +606,9 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
-
+        
         image_ids = kwargs.pop("image_ids", None)
+        print(image_ids)
         if self.cfg.app_opt:
             colors = self.app_module(
                 features=self.splats["features"],
@@ -640,7 +642,7 @@ class Runner:
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
-            rasterize_mode=cfg.rasterize_mode,
+            rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
             camera_model=self.cfg.camera_model,
             with_ut=self.cfg.with_ut,
@@ -699,6 +701,32 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
+
+        print("\n" + "="*60)
+        print("🚀 EXPERIMENT SUMMARY")
+        print("="*60)
+
+          # mcmc / default
+        print(f"Data dir:            {cfg.data_dir}")
+        print(f"Colmap dir:          {cfg.colmap_dir}")
+        print(f"Result dir:          {cfg.result_dir}")
+
+        print(f"Max steps:           {cfg.max_steps}")
+        print(f"Batch size:          {cfg.batch_size}")
+        print(f"Data factor:         {cfg.data_factor}")
+
+        print(f"App opt:             {cfg.app_opt}")
+        print(f"App embed dim:       {cfg.app_embed_dim}")
+        print(f"Feature dim:         {cfg.feature_dim}")
+
+        print(f"Antialiased:         {cfg.antialiased}")
+        print(f"Post-processing:     {cfg.post_processing}")
+
+        print(f"SSIM lambda:         {cfg.ssim_lambda}")
+        print(f"Opacity reg:         {cfg.opacity_reg}")
+        print(f"Scale reg:           {cfg.scale_reg}")
+
+        print("="*60 + "\n")
 
         # Dump cfg.
         if world_rank == 0:
@@ -922,7 +950,13 @@ class Runner:
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
-
+            if step % 500 == 0 and world_rank == 0:
+                if not cfg.app_opt:
+                    print(f"[Debug] SH0 range: [{self.splats['sh0'].min():.4f}, {self.splats['sh0'].max():.4f}]")
+                
+                print(f"[Debug] Render range: [{colors.min():.4f}, {colors.max():.4f}]")
+                print(f"[Debug] Loss breakdown: L1={l1loss:.4f}, SSIM={ssimloss:.4f}")
+            # save checkpoint before updating the model
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3

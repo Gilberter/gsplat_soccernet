@@ -16,195 +16,404 @@ source /opt/miniforge3/etc/profile.d/conda.sh
 conda activate soccernet
 
 export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
+export CUDA_LAUNCH_BLOCKING=1
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-srun python3 -c "
-import torch
-print(f'PyTorch: {torch.__version__}')
-print(f'CUDA available: {torch.cuda.is_available()}')
-if torch.cuda.is_available():
-    print(f'GPU: {torch.cuda.get_device_name(0)}')
-    print(f'Compute capability: {torch.cuda.get_device_capability()}')
-print(torch.cuda.get_arch_list())
-"
+print_header() {
+    echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC} $1"
+    echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
+}
+
+print_info() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+if [ $# -lt 2 ]; then
+    print_error "Not enough arguments"
+    echo "Usage: SCENE DENSIFICATION [FLAGS]"
+    echo "  SCENE: Scene name (e.g., soccernet)"
+    echo "  DENSIFICATION: 'classic' or 'mcmc'"
+    echo ""
+    echo "Flags:"
+    echo "  --absgrad               Enable absolute gradients"
+    echo "  --antialiased           Enable antialiased rasterization"
+    echo "  --app-opt               Enable appearance optimization"
+    echo "  --post-processing {bilateral_grid,ppisp}      Enable bilateral grid post-processing"
+    echo "  --data-factor N         Downsample factor (default: 1)"
+    echo "  --max-steps N           Max steps (default: 40000)"
+    echo "  --colmap-dir PATH       Path to COLMAP sparse folder"
+    echo "  --data-dir PATH         Path to dataset"
+    echo "  --packed                Enable Packed Mode"
+    echo "  --depth_loss            Enable Packed Mode"
+    echo "  --depth_ground            Enable Packed Mode"
+    echo "  --depth_model {da3metric-large, da3mono-large}            Enable Packed Mode"
+    echo "  --strategy_depth        Strategy "
+
+    exit 1
+fi
 
 # -------------------------
 # Arguments
 # -------------------------
+
+
 SCENE=$1
-VERSION=$2
-RASTER_MODE=${3:-0}      # 0 classic, 1 antialiased
-BILATERAL=${4:-0}        # Default: OFF (memory intensive!)
-ANTIALIASED=${5:-0}      # Default: OFF (hurts PSNR)
-ABSGRAD=${6:-1}          # Default: ON (minimal memory impact)
-DENSIFICATION=${7:-0}    # 0=default, 1=mcmc
-APP_OPT=${8:-0}          # Default: OFF (memory intensive!)
-MAX_STEPS=${9:-40000}
-PACKED_MODE=${10:-1}     # Default: ON (reduces memory)
-DATA_FACTOR=${11:-1}     # Default: 1 (full resolution)
-DEPTH_MODEL=${12:-"da3metric-large"}
-GROUND_LOSS=${13:-0}
+DENSIFICATION=$2
+shift 2
 
-# MORE SETTINGS (tune for best PSNR, but may increase memory):
+# Validate densification type
+if [[ ! "$DENSIFICATION" =~ ^(classic|mcmc)$ ]]; then
+    print_error "DENSIFICATION must be 'classic' or 'mcmc', got: $DENSIFICATION"
+    exit 1
+fi
 
-SSIM_LAMBDA=${SSIM_LAMBDA:-0.2}        # Default: 0.2 (tune for best PSNR)
-OPACITY_REG=${OPACITY_REG:-0.01}       # Default: 0.01 (tune for best PSNR)
-SCALE_REG=${SCALE_REG:-0.01}         # Default: 0.01 
-APP_EMBED_DIM=${APP_EMBED_DIM:-16}       # Default: 16 (tune: 8, 16, 32, 64)
-FEATURE_DIM=${FEATURE_DIM:-32}         # Default: 32 (tune: 16, 32, 64 when app_opt=ON)
-GROW_GRAD2D=${GROW_GRAD2D:-0.0008}     # Default: 0.0008 (for absgrad)
-BILATERAL_SHAPE_X=${BILATERAL_SHAPE_X:-16}   # Bilateral grid X dimension
-BILATERAL_SHAPE_Y=${BILATERAL_SHAPE_Y:-16}   # Bilateral grid Y dimension
-BILATERAL_SHAPE_W=${BILATERAL_SHAPE_W:-8}    # Bilateral grid color dimension
+
+
+# Feature flags
+ABSGRAD=false
+ANTIALIASED=false
+APP_OPT=false
+BILATERAL=false
+PPISP=false
+PACKED=false
+DEPTH_LOSS=true
+DEPTH_GROUND=false
+DEPTH_MODEL="DA3MONO-LARGE"
+STRATEGY_DEPTH="progressive"
+
+# Hyperparameters
+DATA_FACTOR=2
+MAX_STEPS=40000
+OPACITY_REG=0.01
+SCALE_REG=0.01
+APP_EMBED_DIM=16
+FEATURE_DIM=32
+GROW_GRAD2D=0.0008
+
+# Bilateral grid parameters
+BILATERAL_SHAPE_X=16
+BILATERAL_SHAPE_Y=16
+BILATERAL_SHAPE_W=8
+
+# Paths (set defaults, can be overridden)
+DATA_DIR="/disk/SN-NVS-2026-raw/${SCENE}"
+COLMAP_DIR="/disk/SN-NVS-2026-raw/${SCENE}/sparse/0"
+CHALLENGE_DIR="/disk/SN-NVS-2026-raw/${SCENE}-challenge"
 GROUND_DIR=/disk/SN-NVS-2026-raw/${SCENE}/mask/masks
+DEPTH_DIR=${DATA_DIR}/dae3/${DEPTH_MODEL}/depth_maps.npz
 
 
 
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --absgrad)
+            ABSGRAD=true
+            shift
+            ;;
+        --antialiased)
+            ANTIALIASED=true
+            shift
+            ;;
+        --app-opt)
+            APP_OPT=true
+            shift
+            ;;
+        --depth_loss)
+            DEPTH_LOSS=true
+            shift
+            ;;
+        --depth_ground)
+            DEPTH_GROUND=true
+            shift
+            ;;
+        --post-processing)
+            case $2 in
+                bilateral*) # Matches bilateral or bilateral_grid
+                    BILATERAL=true ;;
+                ppisp)
+                    PPISP=true ;;
+                *)
+                    echo "Warning: Unknown post-processing method '$2'" ;;
+            esac
+            shift 2
+            ;;
+        --data-factor)
+            DATA_FACTOR=$2
+            shift 2
+            ;;
+        --max-steps)
+            MAX_STEPS=$2
+            shift 2
+            ;;
+        --opacity-reg)
+            OPACITY_REG=$2
+            shift 2
+            ;;
+        --scale-reg)
+            SCALE_REG=$2
+            shift 2
+            ;;
+        --data-dir)
+            DATA_DIR=$2
+            shift 2
+            ;;
+        --colmap-dir)
+            COLMAP_DIR=$2
+            shift 2
+            ;;
+        --feature-dim)
+            FEATURE_DIM=$2
+            shift 2
+            ;;
+        --app-embed-dim)
+            APP_EMBED_DIM=$2
+            shift 2
+            ;;
 
-if [ "$RASTER_MODE" -eq 1 ]; then
-    RASTERIZE_MODE="antialiased"
-else
-    RASTERIZE_MODE="classic"
+        --strategy_depth)
+            STRATEGY_DEPTH=$2
+            shift 2
+            ;;
+
+        --grow-grad2d)
+            GROW_GRAD2D=$2
+            shift 2
+            ;;
+
+        --bilateral-shape)
+            BILATERAL_SHAPE_X=$2
+            BILATERAL_SHAPE_Y=$3
+            BILATERAL_SHAPE_W=$4
+            shift 4
+            ;;
+        *)
+            print_warning "Unknown flag: $1"
+            shift
+            ;;
+    esac
+done
+
+FEATURES=()
+
+## ADD FEATURES TO ADD TO THE NAME OF THE FOLDER
+if [ "$ABSGRAD" = true ]; then
+    FEATURES+=("absgrad")
 fi
 
-if [ "$DENSIFICATION" -eq 1 ]; then
-    DENSIFICATION_STRATEGY="mcmc"
-else
-    DENSIFICATION_STRATEGY="default --strategy.grow_grad2d $GROW_GRAD2D"
+if [ "$ANTIALIASED" = true ]; then
+    FEATURES+=("antialiased")
 fi
 
-# Post-processing mode selection
-if [ "$POST_PROCESSING" -eq 1 ]; then
-    POST_PROC_MODE="bilateral_grid"
-    POST_PROC_FLAG="--bilateral_grid_fused --post_processing bilateral_grid --bilateral_grid_shape $BILATERAL_SHAPE_X $BILATERAL_SHAPE_Y $BILATERAL_SHAPE_W"
-elif [ "$POST_PROCESSING" -eq 2 ]; then
-    POST_PROC_MODE="ppisp"
-    POST_PROC_FLAG="--post_processing ppisp --ppisp_use_controller true --ppisp_controller_distillation true"
-else
-    POST_PROC_MODE="none"
-    POST_PROC_FLAG=""
+if [ "$APP_OPT" = true ]; then
+    FEATURES+=("appopt")
 fi
+
+if [ "$PPISP" = true ]; then
+    FEATURES+=("ppisp")
+fi
+
+if [ "$BILATERAL" = true ]; then
+    FEATURES+=("bilateral")
+fi
+
+
+
+
+# If no features, use baseline
+if [ ${#FEATURES[@]} -eq 0 ]; then
+    FEATURES=("baseline")
+fi
+
+FEATURE_NAME=$(IFS=_; echo "${FEATURES[*]}")
+
+# Generate configuration suffix based on non-default parameters
+CONFIG_SUFFIX=""
+if [ "$MAX_STEPS" != "40000" ]; then
+    CONFIG_SUFFIX="${CONFIG_SUFFIX}_s${MAX_STEPS}"
+fi
+
+
+OUTPUT_BASE_DIR="${CHALLENGE_DIR}/results-depth-prior/${DENSIFICATION}/${FEATURE_NAME}${CONFIG_SUFFIX}"
+
+# Handle multiple runs (run1, run2, etc.)
+if [ -d "$OUTPUT_BASE_DIR" ]; then
+    i=1
+    while [ -d "${OUTPUT_BASE_DIR}_run${i}" ]; do
+        ((i++))
+    done
+    OUTPUT_DIR="${OUTPUT_BASE_DIR}_run${i}"
+    RUN_NUM=$i
+else
+    OUTPUT_DIR="$OUTPUT_BASE_DIR"
+    RUN_NUM=0
+fi
+
+
+# Temporary training directory – lives in /tmp and is cleaned up after eval
+RESULT_DIR="/tmp/gsplat_train_${SCENE}_${DENSIFICATION}_${FEATURE_NAME}${CONFIG_SUFFIX}_run${RUN_NUM}"
+
+
+mkdir -p "$RESULT_DIR"
+mkdir -p "$OUTPUT_DIR"
+mkdir -p ./logs
+
+LOG_FILE="$OUTPUT_DIR/experiment_log.txt"
+CONFIG_FILE="$OUTPUT_DIR/config.txt"
+
+
+{
+    print_header "EXPERIMENT CONFIGURATION"
+
+    echo ""
+    echo "📋 EXPERIMENT IDENTITY"
+    printf "%-30s %s\n" "Scene:" "$SCENE"
+    printf "%-30s %s\n" "Densification:" "$DENSIFICATION"
+    printf "%-30s %s\n" "Feature Set:" "$FEATURE_NAME"
+    printf "%-30s %s\n" "Run Number:" "$RUN_NUM"
+
+    echo ""
+    echo "🔧 TRAINING PARAMETERS"
+    printf "%-30s %s\n" "Max Steps:" "$MAX_STEPS"
+    printf "%-30s %s\n" "Data Factor:" "$DATA_FACTOR"
+    printf "%-30s %s\n" "Batch Size:" "1"
+    printf "%-30s %s\n" "SH Degree:" "3"
+
+    echo ""
+    echo "🎯 FEATURES ENABLED"
+    [ "$ABSGRAD" = true ]     && printf "%-30s %s\n" "Absgrad:"       "✓ ON" || printf "%-30s %s\n" "Absgrad:"       "✗ OFF"
+    [ "$ANTIALIASED" = true ] && printf "%-30s %s\n" "Antialiased:"   "✓ ON" || printf "%-30s %s\n" "Antialiased:"   "✗ OFF"
+    [ "$APP_OPT" = true ]     && printf "%-30s %s\n" "App Opt:"       "✓ ON" || printf "%-30s %s\n" "App Opt:"       "✗ OFF"
+    [ "$BILATERAL" = true ]   && printf "%-30s %s\n" "Bilateral Grid:" "✓ ON" || printf "%-30s %s\n" "Bilateral Grid:" "✗ OFF"
+    [ "$PPISP" = true ]       && printf "%-30s %s\n" "PPISP:"         "✓ ON" || printf "%-30s %s\n" "PPISP:"         "✗ OFF"
+
+    echo ""
+    echo "📊 HYPERPARAMETERS"
+    printf "%-30s %s\n" "Depth Strategy:" "$STRATEGY_DEPTH"
+    printf "%-30s %s\n" "Opacity Reg:" "$OPACITY_REG"
+    printf "%-30s %s\n" "Scale Reg:" "$SCALE_REG"
+    printf "%-30s %s\n" "Feature Dim:" "$FEATURE_DIM"
+    printf "%-30s %s\n" "App Embed Dim:" "$APP_EMBED_DIM"
+    printf "%-30s %s\n" "SSIM_LAMBDA:" "$SSIM_LAMBDA"
+
+    [ "$ABSGRAD" = true ]   && printf "%-30s %s\n" "Grow Grad2D:" "$GROW_GRAD2D"
+    [ "$BILATERAL" = true ] && printf "%-30s %s\n" "Bilateral Grid Shape:" "($BILATERAL_SHAPE_X, $BILATERAL_SHAPE_Y, $BILATERAL_SHAPE_W)"
+    [ "$PPISP" = true ]     && printf "%-30s %s\n" "PPISP:" "✓ ON" || printf "%-30s %s\n" "PPISP:" "✗ OFF"
+
+    echo ""
+    echo "📂 PATHS"
+    printf "%-30s %s\n" "Data Directory:" "$DATA_DIR"
+    printf "%-30s %s\n" "COLMAP Directory:" "$COLMAP_DIR"
+    printf "%-30s %s\n" "Temp Train Directory:" "$RESULT_DIR"
+    printf "%-30s %s\n" "Output Directory:" "$OUTPUT_DIR"
+
+    echo ""
+    echo "⏱️ TIMING"
+    printf "%-30s %s\n" "Start Time:" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+} | tee "$LOG_FILE"
+
+cp "$LOG_FILE" "$CONFIG_FILE"
+
+print_info "Configuration logged to: $LOG_FILE"
+
 
 FLAGS=""
-[ "$BILATERAL"      -eq 1 ] && FLAGS="$FLAGS --bilateral_grid_fused --post_processing bilateral_grid"
-[ "$ANTIALIASED"    -eq 1 ] && FLAGS="$FLAGS --antialiased"
-[ "$ABSGRAD"        -eq 1 ] && FLAGS="$FLAGS --strategy.absgrad --absgrad"
-[ "$APP_OPT"        -eq 1 ] && FLAGS="$FLAGS --app_opt --app_embed_dim $APP_EMBED_DIM"
-[ "$PACKED_MODE"    -eq 1 ] && FLAGS="$FLAGS --packed"
-[ "$GROUND_LOSS"    -eq 1 ] && FLAGS="$FLAGS --ground_depth_loss --ground_seg_dir $GROUND_DIR "
+FLAGS="$FLAGS --disable_viewer"
+FLAGS="$FLAGS --data_factor $DATA_FACTOR"
+FLAGS="$FLAGS --opacity_reg $OPACITY_REG"
+FLAGS="$FLAGS --scale_reg $SCALE_REG"
+FLAGS="$FLAGS --feature_dim $FEATURE_DIM"
+FLAGS="$FLAGS --max_steps $MAX_STEPS"
+
+
+# Add conditional flags
+if [ "$ABSGRAD" = true ]; then
+    FLAGS="$FLAGS --strategy.absgrad --absgrad --strategy.grow_grad2d $GROW_GRAD2D"
+fi
+
+if [ "$ANTIALIASED" = true ]; then
+    FLAGS="$FLAGS --antialiased"
+fi
+
+if [ "$APP_OPT" = true ]; then
+    FLAGS="$FLAGS --app_opt --app_embed_dim $APP_EMBED_DIM"
+fi
+
+if [ "$BILATERAL" = true ]; then
+    FLAGS="$FLAGS --post_processing bilateral_grid --bilateral_grid_fused"
+    FLAGS="$FLAGS --bilateral_grid_shape $BILATERAL_SHAPE_X $BILATERAL_SHAPE_Y $BILATERAL_SHAPE_W"
+fi
+
+if [ "$DEPTH_LOSS" = true ]; then
+    FLAGS="$FLAGS --depth_loss --strategy_depth $STRATEGY_DEPTH"
+fi
+
+if [ "$PPISP" = true ]; then
+    FLAGS="$FLAGS --post_processing ppisp"
+fi
+
+
+# [ "$GROUND_LOSS"    -eq 1 ] && FLAGS="$FLAGS --ground_depth_loss --ground_seg_dir $GROUND_DIR "
 
 # -------------------------
 # Paths
 # -------------------------
 
-DATA_DIR=/disk/SN-NVS-2026-raw/${SCENE}
-RESULT_DIR=/disk/SN-NVS-2026-raw/results-soccernet/${SCENE}-${VERSION}
-COLMAP_DIR=/disk/SN-NVS-2026-raw/${SCENE}/sparse/0
-CHALLENGE_DIR=/disk/SN-NVS-2026-raw/${SCENE}-challenge
-DEPTH_DIR=${DATA_DIR}/dae3/${DEPTH_MODEL}/depth_maps.npz
-
-BASE_DIR="$CHALLENGE_DIR/${SCENE}-${VERSION}"
-RESULT_BASE=/disk/SN-NVS-2026-raw/results-soccernet/${SCENE}-${VERSION}
-
-if [ -d "$RESULT_BASE" ]; then
-    i=1
-    while [ -d "${RESULT_BASE}_run$i" ]; do
-        ((i++))
-    done
-    RESULT_DIR="${RESULT_BASE}_run$i"
-    OUTPUT_DIR="${BASE_DIR}_run$i"
+if [ "$DENSIFICATION" = "mcmc" ]; then
+    DENSIFICATION_CMD="mcmc"
 else
-    RESULT_DIR="$RESULT_BASE"
-    OUTPUT_DIR="$BASE_DIR"
+    DENSIFICATION_CMD="default"
 fi
 
-mkdir -p "$RESULT_DIR"
+# ============================================================================
+# TRAINING
+# ============================================================================
 
-mkdir -p "$OUTPUT_DIR"
+print_header "STARTING TRAINING"
+print_info "Scene: $SCENE"
+print_info "Densification: $DENSIFICATION"
+print_info "Features: $FEATURE_NAME"
+print_info "Temp output: $RESULT_DIR"
 
-CKPT=$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt
-
-LOG_FILE_TRAIN=$RESULT_DIR/run_config.txt
-
-
-{
-echo "============================================================"
-echo "⚙️ CONFIGURATION"
-echo "============================================================"
-
-printf "%-25s %s\n" "Scene:" "$SCENE"
-printf "%-25s %s\n" "Version:" "$VERSION"
-printf "%-25s %s\n" "Max steps:" "$MAX_STEPS"
-printf "%-25s %s\n" "Data factor:" "$DATA_FACTOR"
-
-echo "------------------------------------------------------------"
-
-printf "%-25s %s\n" "Raster mode:" "$RASTERIZE_MODE"
-printf "%-25s %s\n" "Packed mode:" "$([ "$PACKED_MODE" -eq 1 ] && echo ON || echo OFF)"
-printf "%-25s %s\n" "Absgrad:" "$([ "$ABSGRAD" -eq 1 ] && echo ON || echo OFF)"
-printf "%-25s %s\n" "App opt:" "$([ "$APP_OPT" -eq 1 ] && echo ON || echo OFF)"
-printf "%-25s %s\n" "Bilateral:" "$([ "$BILATERAL" -eq 1 ] && echo ON || echo OFF)"
-printf "%-25s %s\n" "Antialiased:" "$([ "$ANTIALIASED" -eq 1 ] && echo ON || echo OFF)"
-
-echo "------------------------------------------------------------"
-
-printf "%-25s %s\n" "Opacity reg:" "$OPACITY_REG"
-printf "%-25s %s\n" "Scale reg:" "$SCALE_REG"
-printf "%-25s %s\n" "App embed dim:" "$APP_EMBED_DIM"
-
-echo "============================================================"
-
-echo "============================================================"
-echo "📂 PATHS"
-echo "============================================================"
-
-printf "%-20s %s\n" "DATA_DIR:" "$DATA_DIR"
-printf "%-20s %s\n" "RESULT_DIR:" "$RESULT_DIR"
-printf "%-20s %s\n" "COLMAP_DIR:" "$COLMAP_DIR"
-printf "%-20s %s\n" "CKPT:" "$CKPT"
-printf "%-20s %s\n" "DEPTHMAP:" "$DEPTH_DIR"
-
-echo "============================================================"
-
-echo "============================================================"
-echo "🏋️ START TRAINING"
-echo "============================================================"
-
-} >> "$LOG_FILE_TRAIN"
 START_TIME=$(date +%s)
-# -------------------------
-# Training with MEMORY OPTIMIZATIONS
-# -------------------------
-{
-echo "Starting training at $(date)"
-} >> "$LOG_FILE_TRAIN"
 
 # -------------------------
 # Training with MEMORY OPTIMIZATIONS
 # -------------------------
-echo "Starting training at $(date)"
-srun python /home/hensemberk/dev/Soccernet/gsplat/examples/trainer_scene_prior.py $DENSIFICATION_STRATEGY \
+
+srun python /home/hensemberk/dev/Soccernet/gsplat/examples/trainer_scene_prior.py "$DENSIFICATION_CMD" \
     --max_steps $MAX_STEPS \
     --data_dir $DATA_DIR \
     --result_dir $RESULT_DIR \
     --save_steps $MAX_STEPS \
     --data_factor $DATA_FACTOR \
     --no-normalize_world_space \
-    --save_steps 10000 20000 30000 40000 \
     --no-load_exposure \
     --test_every 0 \
     --colmap_dir $COLMAP_DIR \
-    --rasterize_mode $RASTERIZE_MODE \
-    --disable_viewer \
-    --depth_loss \
     --mini_depth_dir $DEPTH_DIR \
     \
     --sh_degree 3 \
-    --opacity_reg $OPACITY_REG \
-    --scale_reg $SCALE_REG \
     \
     --batch_size 1 \
     \
-    $FLAGS 
+    $FLAGS \
+    2>&1 | tee -a "$LOG_FILE"
 
 # --ssim_lambda 0.2 \
 # 
@@ -212,105 +421,91 @@ srun python /home/hensemberk/dev/Soccernet/gsplat/examples/trainer_scene_prior.p
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
-{
-echo "============================================================"
-echo "✅ TRAINING FINISHED"
-echo "⏱️ Duration: $DURATION seconds (~$((DURATION/60)) min)"
-echo "📅 End time: $(date)"
-echo "============================================================"
+# ============================================================================
+# POST-TRAINING: EVAL + COPY CKPT + CLEANUP TEMP DIR
+# ============================================================================
 
-echo "Training completed at $(date) with exit code"
-} >> "$LOG_FILE_TRAIN"
+print_header "TRAINING COMPLETED"
+print_info "Duration: $((DURATION / 60)) minutes ($DURATION seconds)"
 
-# -------------------------
-# Evaluation
-# -------------------------
-srun python /home/hensemberk/dev/Soccernet/gsplat/examples/eval_challenge.py \
-    --ckpt $CKPT \
-    --data_dir $CHALLENGE_DIR \
-    --result_folder "$(basename $OUTPUT_DIR)"
+CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt"
+REPO_ROOT="/home/hensemberk/dev/Soccernet/gsplat"
 
 
-LOG_FILE=$OUTPUT_DIR/run_conf.txt
+if [ -f "$CKPT" ]; then
+    print_info "Checkpoint found: $(basename $CKPT)"
 
-echo "Saving run configuration to $LOG_FILE"
+    # ── 1. Run evaluation (outputs go to OUTPUT_DIR inside CHALLENGE_DIR) ──
+    print_header "RUNNING EVALUATION"
 
-mkdir -p "$(dirname "$LOG_FILE")"
+    srun python "$REPO_ROOT/examples/eval_challenge.py" \
+        --ckpt "$CKPT" \
+        --data_dir "$CHALLENGE_DIR" \
+        --result_folder "$OUTPUT_DIR" \
+        --specific \
+        2>&1 | tee -a "$LOG_FILE"
 
-cat <<EOL > "$LOG_FILE"
-================================================================================
-SLURM JOB INFO
-================================================================================
-Job ID:                $SLURM_JOB_ID
-Node:                  $SLURM_NODELIST
-User:                  $(whoami)
-Start Time:            $(date -d @$START_TIME 2>/dev/null || date)
-End Time:              $(date)
-Duration (sec):        $DURATION
+    # ── 2. Copy the checkpoint into OUTPUT_DIR so everything is together ──
+    CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
+    mkdir -p "$CKPT_DEST_DIR"
+    cp "$CKPT" "$CKPT_DEST_DIR/"
+    print_info "Checkpoint copied to: $CKPT_DEST_DIR/$(basename $CKPT)"
 
-================================================================================
-ENVIRONMENT
-================================================================================
-Conda Env:             $CONDA_DEFAULT_ENV
-Python:                $(which python)
-CUDA Visible Devices:  $CUDA_VISIBLE_DEVICES
+    # ── 3. Delete the temporary training directory ──
+    rm -rf "$RESULT_DIR"
+    print_info "Temp training directory removed: $RESULT_DIR"
 
-================================================================================
-DATA PATHS
-================================================================================
-DATA_DIR:              $DATA_DIR
-RESULT_DIR:            $RESULT_DIR
-COLMAP_DIR:            $COLMAP_DIR
-CHALLENGE_DIR:         $CHALLENGE_DIR
-CKPT:                  $CKPT
-DEPTH_MODEL: $DEPTH_MODEL
-================================================================================
-MAIN CONFIGURATION
-================================================================================
-Scene:                 $SCENE
-Version:               $VERSION
-Max Steps:             $MAX_STEPS
-Data Factor:           $DATA_FACTOR
+else
+    print_warning "Checkpoint not found at: $CKPT"
+    print_warning "Skipping eval and temp-dir cleanup."
+fi
 
-================================================================================
-TRAINING FLAGS
-================================================================================
-Raster Mode:           $RASTERIZE_MODE
-Packed Mode:           $([ "$PACKED_MODE" -eq 1 ] && echo ON || echo OFF)
-AbsGrad:               $([ "$ABSGRAD" -eq 1 ] && echo ON || echo OFF)
-App Opt:               $([ "$APP_OPT" -eq 1 ] && echo ON || echo OFF)
-Bilateral Grid:        $([ "$BILATERAL" -eq 1 ] && echo ON || echo OFF)
-Antialiased:           $([ "$ANTIALIASED" -eq 1 ] && echo ON || echo OFF)
+# ============================================================================
+# GENERATE SUMMARY  (saved to OUTPUT_DIR alongside logs + ckpt)
+# ============================================================================
 
-Densification:         $DENSIFICATION_STRATEGY
+SUMMARY_FILE="$OUTPUT_DIR/SUMMARY.md"
 
-================================================================================
-HYPERPARAMETERS
-================================================================================
-Opacity Reg:           $OPACITY_REG
-Scale Reg:             $SCALE_REG
-SSIM Lambda:           $SSIM_LAMBDA
-App Embed Dim:         $APP_EMBED_DIM
-Feature Dim:           $FEATURE_DIM
-Grow Grad2D:           $GROW_GRAD2D
+cat > "$SUMMARY_FILE" << EOF
+# Experiment Summary
 
-Bilateral Shape X:     $BILATERAL_SHAPE_X
-Bilateral Shape Y:     $BILATERAL_SHAPE_Y
-Bilateral Shape W:     $BILATERAL_SHAPE_W
+## Configuration
+- **Scene**: $SCENE
+- **Densification**: $DENSIFICATION
+- **Features**: $FEATURE_NAME
+- **Run**: ${RUN_NUM}
 
-================================================================================
-FULL COMMAND (REPRODUCIBILITY)
-================================================================================
-python simple_trainer.py $DENSIFICATION_STRATEGY \
-    --max_steps $MAX_STEPS \
-    --data_dir $DATA_DIR \
-    --result_dir $RESULT_DIR \
-    --data_factor $DATA_FACTOR \
-    --colmap_dir $COLMAP_DIR \
-    --rasterize_mode $RASTERIZE_MODE \
-    $FLAGS
+## Parameters
+- **Max Steps**: $MAX_STEPS
+- **Data Factor**: $DATA_FACTOR
+- **Opacity Reg**: $OPACITY_REG
+- **Scale Reg**: $SCALE_REG
 
-================================================================================
-EOL
+## Features Enabled
+- Absgrad: $ABSGRAD
+- Antialiased: $ANTIALIASED
+- App Opt: $APP_OPT
+- Bilateral Grid: $BILATERAL
+- PPISP: $PPISP
+- DEPTH: $DEPTH_LOSS
 
-echo "✅ Run config saved to $LOG_FILE"
+## Results
+- **Start Time**: $(date -d @$START_TIME '+%Y-%m-%d %H:%M:%S')
+- **End Time**: $(date '+%Y-%m-%d %H:%M:%S')
+- **Duration**: $((DURATION / 60)) minutes
+- **Output Dir**: $OUTPUT_DIR
+- **Checkpoint**: $CKPT_DEST_DIR/$(basename $CKPT)
+
+## Paths
+- Data: $DATA_DIR
+- COLMAP: $COLMAP_DIR
+- Challenge: $CHALLENGE_DIR
+- Depth Dir: $DEPTH_DIR
+
+EOF
+
+print_info "Summary saved to: $SUMMARY_FILE"
+
+echo ""
+print_header "✅ EXPERIMENT FINISHED SUCCESSFULLY"
+
