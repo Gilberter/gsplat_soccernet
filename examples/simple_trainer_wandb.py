@@ -61,6 +61,12 @@ from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, gro
 
 from utils_depth import depth_loss_step, ScaleAndShiftInvariantLoss,ScaleAndShiftInvariantLossLight
 
+import wandb # wand import at top
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 @dataclass
 class Config:
@@ -245,6 +251,12 @@ class Config:
     mini_depth_dir: str = ""
 
     feature_dim: int = 32
+
+    use_wandb: bool = True
+    wandb_project: str = "3dgs-challenge"
+    wandb_entity: str = "CVAIL"
+    wandb_run_name: Optional[str] = None
+    wandb_key = os.getenv('WANDB_API_KEY')
 
 
     def adjust_steps(self, factor: float):
@@ -726,6 +738,18 @@ class Runner:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
 
+        if cfg.use_wandb:
+            wandb.init(
+                project=cfg.wandb_project,
+                entity=cfg.wandb_entity,
+                name=cfg.wandb_run_name or f"{cfg.result_dir}",
+                config=vars(cfg),
+                dir=cfg.result_dir,
+                reinit=True,
+                mode="offline",  
+            )
+            print(f"Wandb initialized: {wandb.run.name}")
+
         max_steps = cfg.max_steps
         init_step = 0
 
@@ -1070,6 +1094,17 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+
+
+                if cfg.use_wandb:
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/l1loss": l1loss.item(),
+                        "train/ssimloss": ssimloss.item(),
+                        "train/num_GS": len(self.splats["means"]),
+                        "train/mem": mem,
+                    }, step=step)
+
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss",        depthloss_total.item(),                        step)
                     # self.writer.add_scalar("train/depth_sparse",     depth_info.get("loss_sparse", 0),        step)
@@ -1270,6 +1305,9 @@ class Runner:
         )
         ellipse_time = 0
         metrics = defaultdict(list)
+
+                # Initialize wandb if enable
+        
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -1356,6 +1394,22 @@ class Runner:
             for k, v in stats.items():
                 self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
+
+            if cfg.use_wandb:
+                try:
+                    # Log metrics
+                    wandb.log(stats, step=step)
+                    
+                    # ✅ Optionally log an example rendered image
+                    if len(metrics["psnr"]) > 0:
+                        example_image = wandb.Image(canvas, caption=f"{stage}_example")
+                        wandb.log({"example_render": example_image}, step=step)
+                    
+                    # ✅ Finish the run
+                    wandb.finish()
+                    print(f"✅ Wandb run finished")
+                except Exception as e:
+                    print(f"❌ Wandb logging error: {e}")
 
     @torch.no_grad()
     def render_traj(self, step: int):
