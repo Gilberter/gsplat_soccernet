@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --partition=gpu 
 #SBATCH --mem=25G
-#SBATCH --time 01:00:00
+#SBATCH --time 02:00:00
 
 echo "Running job: $SLURM_JOB_ID"
 echo "Running on node: $SLURM_NODELIST"
@@ -18,8 +18,12 @@ conda activate soccernet
 export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
 export CUDA_LAUNCH_BLOCKING=1
 
-export WANDB_MODE=offline
-export WANDB_DIR="./wandb_logs"
+# export WANDB_MODE=offline
+# export WANDB_DIR="./wandb_logs"
+
+export WANDB_API_KEY=$(cat ~/.wandb_api_key 2>/dev/null || echo "")
+export WANDB_MODE=online          # real-time streaming
+export WANDB_DIR="$RESULT_DIR"    # keep wandb files in temp dir
 
 
 # Color codes for output
@@ -99,12 +103,12 @@ DEPTH_LOSS=false
 DEPTH_GROUND=false
 DEPTH_MODEL="DA3MONO-LARGE"
 STRATEGY_DEPTH="progressive"
-
+SSIM_LAMBDA=0.2
 ## wandb
 
 USE_WANDB=true # use wandb
 WANDB_STEPS_EVAL=1000
-
+WANDB_RUN_NAME=""
 
 # Hyperparameters
 DATA_FACTOR=2
@@ -199,8 +203,11 @@ while [[ $# -gt 0 ]]; do
             APP_EMBED_DIM=$2
             shift 2
             ;;
-
-        --strategy_depth)
+        --ssim-lambda)
+            SSIM_LAMBDA=$2
+            shift 2
+            ;;
+        --strategy-depth)
             STRATEGY_DEPTH=$2
             shift 2
             ;;
@@ -246,6 +253,12 @@ if [ "$BILATERAL" = true ]; then
     FEATURES+=("bilateral")
 fi
 
+if [ "$DEPTH_LOSS" = true ]; then
+    SCENE_OUTPUT="results-depth-prior"
+else
+    SCENE_OUTPUT="${SCENE}"
+fi
+
 
 
 
@@ -263,7 +276,7 @@ if [ "$MAX_STEPS" != "40000" ]; then
 fi
 
 
-OUTPUT_BASE_DIR="${CHALLENGE_DIR}/results-depth-prior/${DENSIFICATION}/${FEATURE_NAME}${CONFIG_SUFFIX}"
+OUTPUT_BASE_DIR="${CHALLENGE_DIR}/${SCENE_OUTPUT}/${DENSIFICATION}/${FEATURE_NAME}${CONFIG_SUFFIX}"
 
 # Handle multiple runs (run1, run2, etc.)
 if [ -d "$OUTPUT_BASE_DIR" ]; then
@@ -282,6 +295,7 @@ fi
 # Temporary training directory – lives in /tmp and is cleaned up after eval
 RESULT_DIR="/tmp/gsplat_train_${SCENE}_${DENSIFICATION}_${FEATURE_NAME}${CONFIG_SUFFIX}_run${RUN_NUM}"
 
+WANDB_RUN_NAME="${SCENE}_${DENSIFICATION}_${FEATURE_NAME}_run${RUN_NUM}"
 
 mkdir -p "$RESULT_DIR"
 mkdir -p "$OUTPUT_DIR"
@@ -356,6 +370,9 @@ FLAGS="$FLAGS --opacity_reg $OPACITY_REG"
 FLAGS="$FLAGS --scale_reg $SCALE_REG"
 FLAGS="$FLAGS --feature_dim $FEATURE_DIM"
 FLAGS="$FLAGS --max_steps $MAX_STEPS"
+FLAGS="$FLAGS --wandb_run_name $WANDB_RUN_NAME"
+FLAGS="$FLAGS --wandb_steps $WANDB_STEPS_EVAL"
+FLAGS="$FLAGS --ssim_lambda $SSIM_LAMBDA"
 
 
 # Add conditional flags
@@ -421,7 +438,6 @@ srun python /home/hensemberk/dev/Soccernet/gsplat/examples/simple_trainer_wandb.
     --data_factor $DATA_FACTOR \
     --no-normalize_world_space \
     --no-load_exposure \
-    --test_every 0 \
     --colmap_dir $COLMAP_DIR \
     --mini_depth_dir $DEPTH_DIR \
     \
@@ -434,6 +450,9 @@ srun python /home/hensemberk/dev/Soccernet/gsplat/examples/simple_trainer_wandb.
 
 # --ssim_lambda 0.2 \
 # 
+
+TRAIN_EXIT=${PIPESTATUS[0]}   # ← must be immediately after, PIPESTATUS is consumed on next command
+echo "Training exit code: $TRAIN_EXIT"
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
@@ -525,40 +544,67 @@ print_info "Summary saved to: $SUMMARY_FILE"
 
 echo ""
 print_header "✅ EXPERIMENT FINISHED SUCCESSFULLY"
+# ============================================================================
+# Post-processing & Wandb Sync
+# ============================================================================
 
+# WANDB_DIR_IN_TMP="$RESULT_DIR/wandb"
 
+# if [ -f "$CKPT" ] && [ "$TRAIN_EXIT" -eq 0 ]; then
 
-# # ============================================================================
-# # Post-processing & Wandb Sync
-# # ============================================================================
-
-# CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt"
-
-# if [ -f "$CKPT" ] && [ $TRAIN_EXIT -eq 0 ]; then
-#     echo "✓ Checkpoint found"
-    
-#     # Copy checkpoint
-#     mkdir -p "$OUTPUT_DIR/ckpts"
-#     cp "$CKPT" "$OUTPUT_DIR/ckpts/"
-#     echo "✓ Checkpoint copied"
-    
-#     # ✅ NEW: Sync wandb runs to cloud
-#     if [ -d "$RESULT_DIR/wandb" ]; then
+#     # ── 1. Sync wandb BEFORE deleting /tmp ──
+#     if [ -d "$WANDB_DIR_IN_TMP" ]; then
 #         echo "🔄 Syncing wandb offline runs to cloud..."
-        
-#         # Set online mode for syncing
 #         export WANDB_MODE=online
-        
-#         wandb sync "$RESULT_DIR/wandb" --clean || echo "⚠ Wandb sync failed (optional)"
-        
-#         echo "✓ Wandb sync complete"
+
+#         SYNC_FAILED=0
+
+#         # offline runs are named offline-run-YYYYMMDD_HHMMSS-<id>
+#         while IFS= read -r run_dir; do
+#             echo "  → Syncing: $(basename $run_dir)"
+#             wandb sync "$run_dir" \
+#                 && echo "  ✓ Synced: $(basename $run_dir)" \
+#                 || { echo "  ⚠ Failed: $(basename $run_dir)"; SYNC_FAILED=1; }
+#         done < <(find "$WANDB_DIR_IN_TMP" -maxdepth 1 -type d -name "offline-run-*")
+
+#         # Check if any runs were actually found
+#         RUN_COUNT=$(find "$WANDB_DIR_IN_TMP" -maxdepth 1 -type d -name "offline-run-*" | wc -l)
+#         if [ "$RUN_COUNT" -eq 0 ]; then
+#             echo "⚠ No offline-run-* directories found in $WANDB_DIR_IN_TMP"
+#             echo "⚠ Contents of wandb dir:"
+#             ls -la "$WANDB_DIR_IN_TMP"
+#         elif [ $SYNC_FAILED -eq 0 ]; then
+#             echo "✓ All $RUN_COUNT wandb run(s) synced successfully"
+#         else
+#             echo "⚠ Some wandb runs failed to sync (non-fatal)"
+#         fi
+#     else
+#         echo "⚠ No wandb directory found at $WANDB_DIR_IN_TMP — skipping sync"
 #     fi
-    
-#     # Cleanup temp directory
-#     rm -rf "$RESULT_DIR"
-#     echo "✓ Temp directory cleaned"
+
+#     # ── 2. Clean up temp directory AFTER sync ──
+#     echo "🧹 Removing temp training directory: $RESULT_DIR"
+#     rm -rf "$RESULT_DIR" \
+#         && echo "✓ Temp directory removed" \
+#         || echo "⚠ Failed to remove temp dir: $RESULT_DIR"
+
 # else
-#     echo "⚠ Training failed or checkpoint not found"
+#     echo "⚠ Training failed (exit=$TRAIN_EXIT) or checkpoint not found at: $CKPT"
+#     echo "⚠ Keeping temp dir for inspection: $RESULT_DIR"
 # fi
 
-# echo "✅ Done! Results: $OUTPUT_DIR"ls 
+
+if [ -f "$CKPT" ] && [ "$TRAIN_EXIT" -eq 0 ]; then
+    CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
+    mkdir -p "$CKPT_DEST_DIR"
+    cp "$CKPT" "$CKPT_DEST_DIR/"
+    print_info "Checkpoint copied to: $CKPT_DEST_DIR/$(basename $CKPT)"
+
+    echo "🧹 Removing temp training directory: $RESULT_DIR"
+    rm -rf "$RESULT_DIR" \
+        && echo "✓ Temp directory removed" \
+        || echo "⚠ Failed to remove temp dir: $RESULT_DIR"
+else
+    echo "⚠ Training failed or checkpoint not found"
+    echo "⚠ Keeping temp dir: $RESULT_DIR"
+fi

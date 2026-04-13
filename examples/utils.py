@@ -129,6 +129,138 @@ class AppearanceOptModule(torch.nn.Module):
         return colors
 
 
+class AppearanceOptModuleV2(torch.nn.Module):
+    """
+    Appearance optimization module.
+
+    Key improvements over the original:
+      1. Residual design — MLP predicts a *delta* over the SH base color,
+         so the Gaussians' geometry-based colors are never overwritten.
+      2. Input normalization (LayerNorm) before the MLP prevents scale
+         mismatch between embeds, features, and SH bases.
+      3. tanh output + learnable scale — keeps deltas bounded and lets
+         the model choose how strongly to shift each color channel.
+      4. Embed dropout — reduces per-camera overfitting, especially with
+         few training views.
+      5. Zero-init on the output layer — at step 0 the module is a no-op,
+         giving the SH colors a head start before appearance kicks in.
+      6. Hard clamp at the end — guarantees valid [0, 1] RGB regardless
+         of what the MLP learned.
+    """
+
+    def __init__(
+        self,
+        n: int,
+        feature_dim: int,
+        embed_dim: int = 16,
+        sh_degree: int = 3,
+        mlp_width: int = 64,
+        mlp_depth: int = 2,
+        embed_dropout: float = 0.1,
+        delta_scale_init: float = 0.1,  # keeps early deltas small
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.sh_degree = sh_degree
+        self.embed_dropout = torch.nn.Dropout(p=embed_dropout)
+
+        self.embeds = torch.nn.Embedding(n, embed_dim)
+        torch.nn.init.normal_(self.embeds.weight, std=0.01)  # small init
+
+        # SH base: DC term only, same as the main splat color head
+        num_sh_bases = (sh_degree + 1) ** 2
+        mlp_in = (embed_dim if embed_dim > 0 else 0) + feature_dim + num_sh_bases
+
+        # LayerNorm over the concatenated input (not over the SH bases alone)
+        self.input_norm = torch.nn.LayerNorm(mlp_in)
+
+        layers: list[torch.nn.Module] = []
+        layers.append(torch.nn.Linear(mlp_in, mlp_width))
+        layers.append(torch.nn.ReLU(inplace=True))
+        for _ in range(mlp_depth - 1):
+            layers.append(torch.nn.Linear(mlp_width, mlp_width))
+            layers.append(torch.nn.ReLU(inplace=True))
+        layers.append(torch.nn.Linear(mlp_width, 3))
+        self.color_head = torch.nn.Sequential(*layers)
+
+        # Zero-init last layer → identity at step 0
+        torch.nn.init.zeros_(self.color_head[-1].weight)
+        torch.nn.init.zeros_(self.color_head[-1].bias)
+
+        # Learnable per-channel scale for the residual delta
+        # Initialised small so early training is dominated by SH colors
+        self.delta_scale = torch.nn.Parameter(
+            torch.full((3,), delta_scale_init)
+        )
+
+    def forward(
+        self,
+        features: Tensor,       # [N, feature_dim]
+        embed_ids: Tensor | None,  # [C]
+        dirs: Tensor,           # [C, N, 3]
+        sh_degree: int,
+        base_colors: Tensor | None = None,  # [C, N, 3] pre-computed SH eval
+    ) -> Tensor:
+        """
+        Returns appearance-corrected colors in [0, 1].
+
+        Args:
+            features:    Per-Gaussian feature vectors [N, feature_dim]
+            embed_ids:   Per-camera embedding indices  [C]  (None → zeros)
+            dirs:        View directions               [C, N, 3]
+            sh_degree:   Current SH degree to evaluate
+            base_colors: Already-evaluated SH colors  [C, N, 3].
+                         Pass these in from rasterize_splats so we don't
+                         re-evaluate SH twice.  If None, we return only
+                         the delta (caller must add the base).
+        """
+        from gsplat.cuda._torch_impl import _eval_sh_bases_fast
+
+        C, N = dirs.shape[:2]
+
+        # ── Camera embeddings ────────────────────────────────────────────
+        if embed_ids is None or self.embed_dim == 0:
+            embeds = torch.zeros(C, self.embed_dim, device=features.device)
+        else:
+            embeds = self.embeds(embed_ids)           # [C, D_embed]
+        embeds = self.embed_dropout(embeds)
+        embeds = embeds[:, None, :].expand(-1, N, -1) # [C, N, D_embed]
+
+        # ── GS features ──────────────────────────────────────────────────
+        feats = features[None, :, :].expand(C, -1, -1)  # [C, N, D_feat]
+
+        # ── SH bases ─────────────────────────────────────────────────────
+        dirs_norm = F.normalize(dirs, dim=-1)
+        num_bases_to_use = (sh_degree + 1) ** 2
+        num_bases_total  = (self.sh_degree + 1) ** 2
+        sh_bases = torch.zeros(C, N, num_bases_total, device=features.device)
+        sh_bases[:, :, :num_bases_to_use] = _eval_sh_bases_fast(
+            num_bases_to_use, dirs_norm
+        )
+
+        # ── Concatenate + normalise ───────────────────────────────────────
+        if self.embed_dim > 0:
+            h = torch.cat([embeds, feats, sh_bases], dim=-1)  # [C, N, D_total]
+        else:
+            h = torch.cat([feats, sh_bases], dim=-1)
+
+        h = self.input_norm(h)  # stabilises early training
+
+        # ── Residual delta ────────────────────────────────────────────────
+        # tanh keeps the raw output in (-1, 1), then we scale it down
+        # with a learnable per-channel factor.  This means the MLP only
+        # ever *shifts* the base color, never replaces it.
+        delta = torch.tanh(self.color_head(h))          # [C, N, 3]
+        delta = delta * self.delta_scale.abs()           # learnable scale
+
+        if base_colors is not None:
+            colors = (base_colors + delta).clamp(0.0, 1.0)
+        else:
+            # Caller is responsible for adding the SH base
+            colors = delta
+
+        return colors
+
 def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
     """
     Converts 6D rotation representation by Zhou et al. [1] to rotation matrix

@@ -45,7 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, AppearanceOptModuleV2, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -198,6 +198,8 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
+    appe_opt_version: Literal["v1", "v2"] = "v2"
+
     # Post-processing method for appearance correction (experimental)
     post_processing: Optional[Literal["bilateral_grid", "ppisp"]] = None
     # Use fused implementation for bilateral grid (only applies when post_processing="bilateral_grid")
@@ -253,10 +255,13 @@ class Config:
     feature_dim: int = 32
 
     use_wandb: bool = True
-    wandb_project: str = "3dgs-challenge"
-    wandb_entity: str = "CVAIL"
+    wandb_project: str = "gsplat"
+    wandb_entity: str = "higilberter-universidad-industrial-de-santander"
     wandb_run_name: Optional[str] = None
     wandb_key = os.getenv('WANDB_API_KEY')
+    wandb_steps: int = 1000
+
+
 
 
     def adjust_steps(self, factor: float):
@@ -348,7 +353,8 @@ def create_splats_with_optimizers(
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
+
+        colors = rgb_to_sh(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
@@ -517,23 +523,33 @@ class Runner:
         self.app_optimizers = []
         if cfg.app_opt:
    
-            self.app_module = AppearanceOptModule(
+            self.app_module = AppearanceOptModuleV2(
                 len(self.trainset), cfg.feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
-            # initialize the last layer to be zero so that the initial output is zero.
-            torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
-            torch.nn.init.zeros_(self.app_module.color_head[-1].bias)
-            self.app_optimizers = [
-                torch.optim.Adam(
-                    self.app_module.embeds.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
-                    weight_decay=cfg.app_opt_reg,
-                ),
-                torch.optim.Adam(
-                    self.app_module.color_head.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size),
-                ),
-            ]
+
+            opt_embeds = torch.optim.Adam(
+                self.app_module.embeds.parameters(),
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
+                weight_decay=cfg.app_opt_reg,
+            )
+
+            opt_color_head = torch.optim.Adam(
+                self.app_module.color_head.parameters(),
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size)
+            )
+
+            opt_layer_norm = torch.optim.Adam(
+                self.app_module.input_norm.parameters(),
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 0.1,
+            )
+            
+            opt_delta_scale = torch.optim.Adam(
+                [self.app_module.delta_scale],
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 0.5,
+            )
+            
+            self.app_optimizers = [opt_embeds, opt_color_head, opt_layer_norm, opt_delta_scale ]
+
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
 
@@ -640,15 +656,19 @@ class Runner:
         image_ids = kwargs.pop("image_ids", None)
         print(image_ids)
         if self.cfg.app_opt:
-            print(f"SHAPE SPLATS FEATURES {self.splats['features'].shape}")
+            #print(f"SHAPE SPLATS FEATURES {self.splats['features'].shape}")
+            
+            sh0 = torch.sigmoid(self.splats["colors"])  # [N, 3]
+            base_colors = sh0[None].expand(camtoworlds.shape[0], -1, -1)  # [C, N, 3]
+
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+                base_colors=base_colors,   
             )
-            colors = colors + self.splats["colors"]
-            colors = torch.sigmoid(colors)
+
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
@@ -745,20 +765,39 @@ class Runner:
                 name=cfg.wandb_run_name or f"{cfg.result_dir}",
                 config=vars(cfg),
                 dir=cfg.result_dir,
-                reinit=True,
-                mode="offline",  
+                reinit="finish_previous",
+                mode="online",  
             )
             print(f"Wandb initialized: {wandb.run.name}")
+            print(f"Wandb URL: {wandb.run.url}")   # prints the direct link to the run
 
         max_steps = cfg.max_steps
         init_step = 0
 
-        schedulers = [
-            # means has a learning rate schedule, that end at 0.01 of the initial value
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
-            ),
-        ]
+        # schedulers = [
+        #     # means has a learning rate schedule, that end at 0.01 of the initial value
+        #     torch.optim.lr_scheduler.ExponentialLR(
+        #         self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+        #     ),
+        # ]
+
+        # NEW SCHEDULERS
+        lr_decay_final = 0.1 
+        warmup_steps = max(1000, max_steps // 20)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizers["means"],
+            start_factor=0.01,
+            total_iters=warmup_steps,
+        )
+        decay_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizers["means"],
+            gamma=lr_decay_final ** (1.0 / (max_steps - warmup_steps))
+        )
+        mean_scheduler = torch.optim.lr_scheduler.ChainedScheduler(
+            [warmup_scheduler, decay_scheduler]
+        )
+        schedulers = [mean_scheduler]
+
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -900,50 +939,8 @@ class Runner:
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
 
-            # if cfg.depth_loss:
-
-            #     if cfg.strategy_depth == "None":
-            #         lambda_base = cfg.depth_lambda
-            #     else:
-            #         lambda_base = get_depth_lambda_schedule(step=step,max_steps=cfg.max_steps,strategy=cfg.strategy_depth,lambda_base=cfg.depth_lambda)
-
-            #     if "MSS" in cfg.depth_loss_to_compute:
-            #         if step == cfg.max_steps * 0.25:
-            #             print(lambda_base)
-            #         if step == cfg.max_steps * 0.70:
-            #             print(lambda_base)
-            #         depthloss, depth_info = depth_loss_step(
-            #             depth_rendered = depth_rendered,          # (1, H, W, 1)  from rasterizer
-            #             da3_depth      = depth_prior,             # (1, 1, H, W)  raw DA3, NOT permuted
-            #             points_px      = points,                  # (1, M, 2)     COLMAP pixels
-            #             depths_colmap  = depths_gt,               # (1, M)        COLMAP metric depths
-            #             scene_scale    = self.scene_scale,
-            #             lambda_sparse  = lambda_base,        # e.g. 1e-2  (high trust)
-            #             lambda_dense   = lambda_base * 0.1,  # e.g. 1e-3  (lower trust)
-            #             device         = device,
-            #         )
-                
-            #         if torch.isfinite(depthloss) and depthloss.item() > 0:
-            #             loss = loss + (depthloss * lambda_base)
-            #         else:
-            #             depthloss = torch.tensor(0.0, device=device)
-
-            #     if "SSIL" in cfg.depth_loss_to_compute:
-
-            #         ssi_loss_fn = ScaleAndShiftInvariantLossLight()
-            #         depth_rendered = depth_rendered.permute(0, 3, 1, 2).squeeze(0)
-            #         mask = torch.ones_like(depth_rendered)
-            #         depth_prior = depth_prior.squeeze(0)
-            #         print(f"Shape mask {mask.shape} depth_prior {depth_prior.shape} depth_rendered {depth_rendered.shape}")
-            #         depthloss = ssi_loss_fn(depth_rendered,depth_prior,mask)
-
-            #         if torch.isfinite(depthloss) and depthloss.item() > 0:
-            #             loss = loss + depthloss
-            #         else:
-            #             depthloss = torch.tensor(0.0, device=device)
-
             if cfg.depth_loss:
-                # ✅ Get scheduled lambda value
+
                 if cfg.strategy_depth == "None":
                     lambda_base = cfg.depth_lambda
                 else:
@@ -991,7 +988,6 @@ class Runner:
                         mask
                     )
                     
-                    # ✅ FIX 3: Apply lambda_base weighting to SSIL too!
                     if torch.isfinite(depthloss_ssil) and depthloss_ssil.item() > 0:
                         # ✅ FIX 4: Clamp to prevent explosion
                         depthloss_ssil = torch.clamp(depthloss_ssil, max=10.0) * lambda_base
@@ -1001,7 +997,6 @@ class Runner:
                     else:
                         depthloss_ssil = torch.tensor(0.0, device=device)
 
-                # ✅ FIX 5: Add total depth loss with proper scaling
                 if depthloss_total > 0:
                     loss = loss + depthloss_total
                     if step % 500 == 0:
@@ -1009,39 +1004,39 @@ class Runner:
                             f"RGB loss: {l1loss.item():.6f}, Combined loss: {loss.item():.6f}")
                         
 
-            if cfg.ground_depth_loss and ground_masks is not None and step >= cfg.ground_depth_start_step:
+            # if cfg.ground_depth_loss and ground_masks is not None and step >= cfg.ground_depth_start_step:
                 
-                viewmats_c = torch.linalg.inv(camtoworlds)    # [1, 4, 4]
+            #     viewmats_c = torch.linalg.inv(camtoworlds)    # [1, 4, 4]
 
-                D_gt = build_ground_depth_map(
-                    viewmats   = viewmats_c[0],               # [1, 4, 4] → [C, 4, 4]  C=1
-                    Ks         = Ks[0].unsqueeze(0),          # [1, 3, 3]
-                    masks      = ground_masks,                # [1, H, W]
-                    width      = width,
-                    height     = height,
-                    near_plane = cfg.near_plane,
-                    far_plane  = cfg.far_plane,
-                )                                             # [1, H, W]
+            #     D_gt = build_ground_depth_map(
+            #         viewmats   = viewmats_c[0],               # [1, 4, 4] → [C, 4, 4]  C=1
+            #         Ks         = Ks[0].unsqueeze(0),          # [1, 3, 3]
+            #         masks      = ground_masks,                # [1, H, W]
+            #         width      = width,
+            #         height     = height,
+            #         near_plane = cfg.near_plane,
+            #         far_plane  = cfg.far_plane,
+            #     )                                             # [1, H, W]
 
-                da3 = data["mini_depth"].to(device).unsqueeze(0) if "mini_depth" in data else None
+            #     da3 = data["mini_depth"].to(device).unsqueeze(0) if "mini_depth" in data else None
 
-                gnd_loss, gnd_info = ground_supervision_loss(
-                    depths_image       = depths_image,        # [1, H, W, 1]
-                    render_normals     = None,                # set from 2DGS outputs if using 2DGS
-                    normals_from_depth = None,
-                    alpha_map          = alphas,
-                    da3_depth          = da3,
-                    D_gt               = D_gt,
-                    ground_mask        = ground_masks,        # [1, H, W]
-                    scene_scale        = self.scene_scale,
-                    lambda_da3         = 1.0,
-                    lambda_ground      = cfg.ground_depth_lambda,  # 2.3
-                    lambda_normal      = 0.05,                # only active when use_2dgs=True
-                    use_2dgs           = False,               # flip to True with simple_trainer_2dgs
-                )
+            #     gnd_loss, gnd_info = ground_supervision_loss(
+            #         depths_image       = depths_image,        # [1, H, W, 1]
+            #         render_normals     = None,                # set from 2DGS outputs if using 2DGS
+            #         normals_from_depth = None,
+            #         alpha_map          = alphas,
+            #         da3_depth          = da3,
+            #         D_gt               = D_gt,
+            #         ground_mask        = ground_masks,        # [1, H, W]
+            #         scene_scale        = self.scene_scale,
+            #         lambda_da3         = 1.0,
+            #         lambda_ground      = cfg.ground_depth_lambda,  # 2.3
+            #         lambda_normal      = 0.05,                # only active when use_2dgs=True
+            #         use_2dgs           = False,               # flip to True with simple_trainer_2dgs
+            #     )
 
-                if torch.isfinite(gnd_loss):
-                    loss = loss + gnd_loss
+            #     if torch.isfinite(gnd_loss):
+            #         loss = loss + gnd_loss
 
 
             if cfg.post_processing == "bilateral_grid":
@@ -1096,6 +1091,25 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
 
 
+                if step % 500 == 0 and world_rank == 0:
+                    opacities = torch.sigmoid(self.splats["opacities"].flatten())
+                    scales = torch.exp(self.splats["scales"])
+                    
+                    print(f"[Step {step}] Gaussian Health Check:")
+                    print(f"  Opacities: min={opacities.min():.4f}, max={opacities.max():.4f}, mean={opacities.mean():.4f}")
+                    print(f"  Scales: min={scales.min():.4f}, max={scales.max():.4f}, mean={scales.mean():.4f}")
+                    print(f"  Num GSs: {len(self.splats['means'])}")
+                    print(f"  Num collapsed (<0.01 opacity): {(opacities < 0.01).sum()}/{len(opacities)}")
+                    
+                    if cfg.use_wandb:
+                        wandb.log({
+                            "gaussian/opacity_min": opacities.min().item(),
+                            "gaussian/opacity_max": opacities.max().item(),
+                            "gaussian/opacity_mean": opacities.mean().item(),
+                            "gaussian/num_gaussians": len(self.splats["means"]),
+                            "gaussian/collapsed_count": (opacities < 0.01).sum().item(),
+                        }, step=step)
+
                 if cfg.use_wandb:
                     wandb.log({
                         "train/loss": loss.item(),
@@ -1107,6 +1121,8 @@ class Runner:
 
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss",        depthloss_total.item(),                        step)
+                    wandb.log({"train/depth_lambda": lambda_base}, step=step)
+
                     # self.writer.add_scalar("train/depth_sparse",     depth_info.get("loss_sparse", 0),        step)
                     # self.writer.add_scalar("train/depth_dense",      depth_info.get("loss_dense",  0),        step)
                     # self.writer.add_scalar("train/da3_scale_s",      depth_info.get("da3_scale_s", 1.0),      step)
@@ -1274,6 +1290,9 @@ class Runner:
                 #self.render_traj(step)
                 pass
 
+            if step % cfg.wandb_steps == 0:
+                self.eval(step) 
+
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
@@ -1290,6 +1309,13 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+        if cfg.use_wandb:
+            # ✅ Finish the run
+            wandb.finish()
+            print(f"✅ Wandb run finished")
+
+
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1405,9 +1431,7 @@ class Runner:
                         example_image = wandb.Image(canvas, caption=f"{stage}_example")
                         wandb.log({"example_render": example_image}, step=step)
                     
-                    # ✅ Finish the run
-                    wandb.finish()
-                    print(f"✅ Wandb run finished")
+                    
                 except Exception as e:
                     print(f"❌ Wandb logging error: {e}")
 
