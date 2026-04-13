@@ -45,7 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, AppearanceOptModuleV2, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -315,11 +315,11 @@ def create_splats_with_optimizers(
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
     else:
-        print("Sanity Check Feature DIM On")
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
+
+        colors = rgb_to_sh(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
@@ -484,28 +484,39 @@ class Runner:
                 self.pose_perturb = DDP(self.pose_perturb)
 
         self.app_optimizers = []
+
         if cfg.app_opt:
-            
-            self.app_module = AppearanceOptModule(
+
+            self.app_module = AppearanceOptModuleV2(
                 len(self.trainset), cfg.feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
-            print(f"Sanity Check feature dim {cfg.feature_dim}")
-            # initialize the last layer to be zero so that the initial output is zero.
-            torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
-            torch.nn.init.zeros_(self.app_module.color_head[-1].bias)
-            self.app_optimizers = [
-                torch.optim.Adam(
-                    self.app_module.embeds.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
-                    weight_decay=cfg.app_opt_reg,
-                ),
-                torch.optim.Adam(
-                    self.app_module.color_head.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size),
-                ),
-            ]
+
+            opt_embeds = torch.optim.Adam(
+                self.app_module.embeds.parameters(),
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
+                weight_decay=cfg.app_opt_reg,
+            )
+
+            opt_color_head = torch.optim.Adam(
+                self.app_module.color_head.parameters(),
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size)
+            )
+
+            opt_layer_norm = torch.optim.Adam(
+                self.app_module.input_norm.parameters(),
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 0.1,
+            )
+
+            opt_delta_scale = torch.optim.Adam(
+                [self.app_module.delta_scale],
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 0.5,
+            )
+
+            self.app_optimizers = [opt_embeds, opt_color_head, opt_layer_norm, opt_delta_scale ]
+
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
+
 
         self.post_processing_module = None
         if cfg.post_processing == "bilateral_grid":
@@ -610,14 +621,18 @@ class Runner:
         image_ids = kwargs.pop("image_ids", None)
         print(image_ids)
         if self.cfg.app_opt:
+
+            sh0 = torch.sigmoid(self.splats["colors"])  # [N, 3]
+            base_colors = sh0[None].expand(camtoworlds.shape[0], -1, -1)  # [C, N, 3]
+
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+                base_colors=base_colors
             )
-            colors = colors + self.splats["colors"]
-            colors = torch.sigmoid(colors)
+
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 

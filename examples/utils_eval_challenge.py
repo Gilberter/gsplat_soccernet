@@ -20,7 +20,7 @@ from gsplat.rendering import rasterization
 import imageio.v3 as iio
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation as qua2rot
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, AppearanceOptModuleV2, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 import PIL
 
@@ -69,11 +69,12 @@ def load_splats(ckpt_paths, device):
                 print(f"   After clamp:  [{base_colors_safe.min():.3f}, {base_colors_safe.max():.3f}]")
 
 
-            app_module = AppearanceOptModule(
+            app_module = AppearanceOptModuleV2(
                 n=n_train,
                 feature_dim=feature_dim,
                 embed_dim=embed_dim,
                 sh_degree=3,
+
             ).to(device)
 
             app_module.load_state_dict(ckpt["app_module"])
@@ -127,6 +128,8 @@ def render_camera(means, quats, scales, opacities, colors, sh_degree,
     viewmat = c2w.inverse().unsqueeze(0)  # [1, 4, 4]
     K_batch = K.unsqueeze(0)              # [1, 3, 3]
 
+    base_rgb = torch.sigmoid(colors)
+    base_rgb = base_rgb[None]   
     if app_module is not None and features is not None:
         print(f"\n{'─'*80}")
         print(f"📊 APPEARANCE OPTIMIZATION PATH")
@@ -169,6 +172,7 @@ def render_camera(means, quats, scales, opacities, colors, sh_degree,
             embed_ids=None,      # Zero embedding for neutral view
             dirs=dirs,
             sh_degree=3,
+            base_colors=base_rgb
         )  # Expected: [1, N, 3]
         
         print(f"\nNetwork output:")
@@ -176,52 +180,55 @@ def render_camera(means, quats, scales, opacities, colors, sh_degree,
         print(f"  color_delta range:  [{color_delta.min():.3f}, {color_delta.max():.3f}]")
         print(f"  color_delta finite: {torch.isfinite(color_delta).all()}")
         
-        # ✅ Clamp base colors to prevent inf/nan
-        colors_safe = torch.clamp(colors, min=-10, max=10)
+        # # ✅ Clamp base colors to prevent inf/nan
+        # colors_safe = torch.clamp(colors, min=-100, max=100)
         
-        print(f"\nBase colors (logit space):")
-        print(f"  colors orig shape:   {colors.shape}")
-        print(f"  colors orig range:   [{colors.min():.3f}, {colors.max():.3f}]")
-        print(f"  colors has inf:      {torch.isinf(colors).any()}")
-        print(f"  colors has nan:      {torch.isnan(colors).any()}")
-        print(f"  colors_safe range:   [{colors_safe.min():.3f}, {colors_safe.max():.3f}]")
+        # print(f"\nBase colors (logit space):")
+        # print(f"  colors orig shape:   {colors.shape}")
+        # print(f"  colors orig range:   [{colors.min():.3f}, {colors.max():.3f}]")
+        # print(f"  colors has inf:      {torch.isinf(colors).any()}")
+        # print(f"  colors has nan:      {torch.isnan(colors).any()}")
+        # print(f"  colors_safe range:   [{colors_safe.min():.3f}, {colors_safe.max():.3f}]")
         
-        # ✅ Squeeze color_delta to match colors shape
-        color_delta_squeezed = color_delta.squeeze(0)  # [1, N, 3] → [N, 3]
+        # # ✅ Squeeze color_delta to match colors shape
+        # color_delta_squeezed = color_delta.squeeze(0)  # [1, N, 3] → [N, 3]
         
-        print(f"\nColor delta after squeeze:")
-        print(f"  shape:  {color_delta_squeezed.shape}")
-        print(f"  range:  [{color_delta_squeezed.min():.3f}, {color_delta_squeezed.max():.3f}]")
+        # print(f"\nColor delta after squeeze:")
+        # print(f"  shape:  {color_delta_squeezed.shape}")
+        # print(f"  range:  [{color_delta_squeezed.min():.3f}, {color_delta_squeezed.max():.3f}]")
         
-        # ✅ Combine: delta + base color (logit space)
-        print(f"\nCombining colors:")
-        # print(f"  color_delta_squeezed:  {color_delta_squeezed.shape}")
-        print(f"  colors_safe:           {colors_safe.shape}")
+        # # ✅ Combine: delta + base color (logit space)
+        # print(f"\nCombining colors:")
+        # # print(f"  color_delta_squeezed:  {color_delta_squeezed.shape}")
+        # print(f"  colors_safe:           {colors_safe.shape}")
         
-        colors_combined = color_delta_squeezed + colors_safe
+        # colors_combined = colors_safe + color_delta_squeezed 
         
-        print(f"  colors_combined (before clamp):")
-        print(f"    shape:   {colors_combined.shape}")
-        print(f"    range:   [{colors_combined.min():.3f}, {colors_combined.max():.3f}]")
-        print(f"    has inf: {torch.isinf(colors_combined).any()}")
-        print(f"    has nan: {torch.isnan(colors_combined).any()}")
+        # print(f"  colors_combined (before clamp):")
+        # print(f"    shape:   {colors_combined.shape}")
+        # print(f"    range:   [{colors_combined.min():.3f}, {colors_combined.max():.3f}]")
+        # print(f"    has inf: {torch.isinf(colors_combined).any()}")
+        # print(f"    has nan: {torch.isnan(colors_combined).any()}")
         
-        # ✅ Clamp to prevent extreme values
-        colors_combined = torch.clamp(colors_combined, min=-10, max=10)
+        # # ✅ Clamp to prevent extreme values
+        # colors_combined = torch.clamp(colors_combined, min=-100, max=100)
         
-        print(f"  colors_combined (after clamp):")
-        print(f"    range:   [{colors_combined.min():.3f}, {colors_combined.max():.3f}]")
+        # print(f"  colors_combined (after clamp):")
+        # print(f"    range:   [{colors_combined.min():.3f}, {colors_combined.max():.3f}]")
         
-        # ✅ Apply sigmoid
-        colors_final = torch.sigmoid(colors_combined)
+        # # ✅ Apply sigmoid
+        # colors_final = torch.sigmoid(colors_combined)
 
-        # ✅ Replace any NaN with neutral gray
-        nan_mask = ~torch.isfinite(colors_final)
-        if nan_mask.any():
-            num_nans = nan_mask.sum().item()
-            print(f"⚠️  WARNING: Found {num_nans} NaN/Inf values in final colors")
-            colors_final[nan_mask] = 0.5  # Neutral gray
-            print(f"   Replaced with 0.5 (neutral gray)")
+        # # ✅ Replace any NaN with neutral gray
+        # nan_mask = ~torch.isfinite(colors_final)
+        # if nan_mask.any():
+        #     num_nans = nan_mask.sum().item()
+        #     print(f"⚠️  WARNING: Found {num_nans} NaN/Inf values in final colors")
+        #     colors_final[nan_mask] = 0.5  # Neutral gray
+        #     print(f"   Replaced with 0.5 (neutral gray)")
+
+        colors_final = color_delta.squeeze(0)
+        render_sh_degree = None
     else:
         colors_final  = colors
         print(f"  colors orig shape:   {colors.shape}")
