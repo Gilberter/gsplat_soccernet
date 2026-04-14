@@ -272,6 +272,8 @@ def relocate(
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
         mask: A boolean mask to indicates which Gaussians are dead.
     """
+
+  
     # support "opacities" with shape [N,] or [N, 1]
     opacities = torch.sigmoid(params["opacities"])
 

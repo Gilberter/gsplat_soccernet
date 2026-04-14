@@ -121,9 +121,9 @@ venv.bak/
 compile_commands.json
 *.dump
 
+
 data
-results
 
-!examples/benchmarks/compression/results/
-
+tests
 logs
+wandb_logs
