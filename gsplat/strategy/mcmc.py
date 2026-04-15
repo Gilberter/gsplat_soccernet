@@ -163,6 +163,7 @@ class MCMCStrategy(Strategy):
             if self.noise_injection_stop_iter >= 0
             else float("inf")
         )
+
         if step < noise_stop:
             inject_noise_to_position(
                 params=params,
