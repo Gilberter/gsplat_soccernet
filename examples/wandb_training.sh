@@ -113,6 +113,7 @@ WANDB_RUN_NAME=""
 # Hyperparameters
 DATA_FACTOR=2
 MAX_STEPS=40000
+MAX_REFINE_STEPS=25000
 OPACITY_REG=0.01
 SCALE_REG=0.01
 APP_EMBED_DIM=16
@@ -173,6 +174,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --max-steps)
             MAX_STEPS=$2
+            shift 2
+            ;;
+        --max-refine)
+            MAX_REFINE_STEPS=$2
             shift 2
             ;;
         --opacity-reg)
@@ -297,6 +302,8 @@ RESULT_DIR="/tmp/gsplat_train_${SCENE}_${DENSIFICATION}_${FEATURE_NAME}${CONFIG_
 
 WANDB_RUN_NAME="${SCENE}_${DENSIFICATION}_${FEATURE_NAME}_run${RUN_NUM}"
 
+WANDB_PATH_CHALLENGE="${CHALLENGE_DIR}/sparse/0"
+
 mkdir -p "$RESULT_DIR"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p ./logs
@@ -320,6 +327,8 @@ CONFIG_FILE="$OUTPUT_DIR/config.txt"
     echo ""
     echo "🔧 TRAINING PARAMETERS"
     printf "%-30s %s\n" "Max Steps:" "$MAX_STEPS"
+    printf "%-30s %s\n" "Max Steps:" "$MAX_REFINE_STEPS"
+    
     printf "%-30s %s\n" "Data Factor:" "$DATA_FACTOR"
     printf "%-30s %s\n" "Batch Size:" "1"
     printf "%-30s %s\n" "SH Degree:" "3"
@@ -373,6 +382,10 @@ FLAGS="$FLAGS --max_steps $MAX_STEPS"
 FLAGS="$FLAGS --wandb_run_name $WANDB_RUN_NAME"
 FLAGS="$FLAGS --wandb_steps $WANDB_STEPS_EVAL"
 FLAGS="$FLAGS --ssim_lambda $SSIM_LAMBDA"
+FLAGS="$FLAGS --max_refine_steps $MAX_REFINE_STEPS"
+FLAGS="$FLAGS --wandb_path_challenge $WANDB_PATH_CHALLENGE"
+
+
 
 
 # Add conditional flags

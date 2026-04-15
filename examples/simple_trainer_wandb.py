@@ -58,6 +58,7 @@ from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss, get_depth_lambda_schedule
 
+from utils_eval_challenge import load_challenges,save_outputs,render_camera, load_splats, save_outputs_canvas, delete_image
 
 from utils_depth import depth_loss_step, ScaleAndShiftInvariantLoss,ScaleAndShiftInvariantLossLight
 
@@ -260,7 +261,14 @@ class Config:
     wandb_run_name: Optional[str] = None
     wandb_key = os.getenv('WANDB_API_KEY')
     wandb_steps: int = 1000
+    wandb_path_challenge:str = ""
 
+    # max refine steps
+    max_refine_steps: int = 25000
+
+    noise_lr:float = 5e5
+
+    min_opacity:float = 0.01 # Default 0.005
 
 
 
@@ -274,13 +282,17 @@ class Config:
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter)
-            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_stop_iter = int(max_refine_steps)
             strategy.reset_every = int(strategy.reset_every * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
         elif isinstance(strategy, MCMCStrategy):
+
             strategy.refine_start_iter = int(strategy.refine_start_iter)
-            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            # strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_stop_iter = int(self.max_steps * 0.8)
+            print(f"STRATEGY REFINE STOP ITERATION {strategy.refine_stop_iter } {int(self.max_steps * 0.8)}")
             strategy.refine_every = int(strategy.refine_every * factor)
+            strategy.min_opacity = self.min_opacity
             if strategy.noise_injection_stop_iter >= 0:
                 strategy.noise_injection_stop_iter = int(
                     strategy.noise_injection_stop_iter * factor
@@ -1050,11 +1062,18 @@ class Runner:
                 )
                 loss += post_processing_reg_loss
 
+            # PROGRESSIVE REGULARIZATION
+            step_ratio = step / max_steps
+            opacity_reg_weight = cfg.opacity_reg * (0.5 + 0.5 * step_ratio)  # Ramps 0.5x → 1.0x
+            scale_reg_weight = cfg.scale_reg * (0.5 + 0.5 * step_ratio)      # Ramps 0.5x → 1.0x
+
+
+
             # regularizations
-            if cfg.opacity_reg > 0.0:
-                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
-            if cfg.scale_reg > 0.0:
-                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+            if opacity_reg_weight > 0.0:
+                loss += opacity_reg_weight * torch.sigmoid(self.splats["opacities"]).mean()
+            if scale_reg_weight > 0.0:
+                loss += scale_reg_weight * torch.exp(self.splats["scales"]).mean()
 
             loss.backward()
 
@@ -1100,6 +1119,7 @@ class Runner:
                     print(f"  Scales: min={scales.min():.4f}, max={scales.max():.4f}, mean={scales.mean():.4f}")
                     print(f"  Num GSs: {len(self.splats['means'])}")
                     print(f"  Num collapsed (<0.01 opacity): {(opacities < 0.01).sum()}/{len(opacities)}")
+                    exploded = (opacities > 0.99).sum().item()
 
                     if cfg.use_wandb:
                         wandb.log({
@@ -1107,7 +1127,9 @@ class Runner:
                             "gaussian/opacity_max": opacities.max().item(),
                             "gaussian/opacity_mean": opacities.mean().item(),
                             "gaussian/num_gaussians": len(self.splats["means"]),
-                            "gaussian/collapsed_count": (opacities < 0.01).sum().item(),
+                            "gaussian/collapsed_count opacities < 0.01": (opacities < 0.01).sum().item(),
+                            "OPACITY LR": opacity_reg_weight,
+                            
                         }, step=step)
 
                 if cfg.use_wandb:
@@ -1116,7 +1138,7 @@ class Runner:
                         "train/l1loss": l1loss.item(),
                         "train/ssimloss": ssimloss.item(),
                         "train/num_GS": len(self.splats["means"]),
-                        "train/mem": mem,
+                        "train/mean_lambda": schedulers[0].get_last_lr()[0]
                     }, step=step)
 
                 if cfg.depth_loss:
@@ -1262,6 +1284,11 @@ class Runner:
             for scheduler in schedulers:
                 scheduler.step()
 
+
+            noise_decay = 0.1 ** (step / cfg.max_steps)  # Decays to 10% by end
+            adjusted_noise_lr = self.cfg.noise_lr * noise_decay
+
+
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
@@ -1273,13 +1300,16 @@ class Runner:
                     packed=cfg.packed,
                 )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
+
+                
+
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
                     info=info,
-                    lr=schedulers[0].get_last_lr()[0],
+                    lr=noise_decay,
                 )
             else:
                 assert_never(self.cfg.strategy)
@@ -1422,18 +1452,51 @@ class Runner:
             self.writer.flush()
 
             if cfg.use_wandb:
-                try:
-                    # Log metrics
-                    wandb.log(stats, step=step)
+                
+                formatted_stats = {k: float(v) if torch.is_tensor(v) else v for k, v in stats.items()}
 
-                    # ✅ Optionally log an example rendered image
-                    if len(metrics["psnr"]) > 0:
-                        example_image = wandb.Image(canvas, caption=f"{stage}_example")
-                        wandb.log({"example_render": example_image}, step=step)
+                # ✅ Optionally log an example rendered image
+                if len(metrics["psnr"]) > 0:
+                    c2w_mats, ks_list, imsize_list, image_ids = load_challenges(cfg.wandb_path_challenge,factor=cfg.data_factor)
+                    c2w = torch.from_numpy(np.array(c2w_mats)).float().to(device)
+                    Ks   = torch.from_numpy(np.array(ks_list)).float().to(device)
+                    # viewmat = c2w[38].inverse().unsqueeze(0)  # [1, 4, 4]
+                    K_batch = Ks[38].unsqueeze(0)              # [1, 3, 3]
+                    #print(f"CWS {c2w.shape} and KS {Ks.shape}")
+                    render_nv, _, _ = self.rasterize_splats(
+                        camtoworlds=c2w[38].unsqueeze(0) ,
+                        Ks=Ks[38].unsqueeze(0) ,
+                        width=width,
+                        height=height,
+                        sh_degree=cfg.sh_degree,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        render_mode="RGB+ED",
+                    )  # [1, H, W, 4]
 
 
-                except Exception as e:
-                    print(f"❌ Wandb logging error: {e}")
+
+                    rgb_part = render_nv[0, ..., :3]
+                    depth_part = render_nv[0, ..., 3]
+
+                    d_min, d_max = depth_part.min(), depth_part.max()
+                    depth_viz = (depth_part - d_min) / (d_max - d_min + 1e-5)
+                    depth_viz = (depth_viz.cpu().numpy() * 255).astype(np.uint8)
+                    
+                    rgb_nv_wandb = (torch.clamp(rgb_part, 0, 1).cpu().numpy() * 255).astype(np.uint8)
+
+                    example_image = wandb.Image(canvas, caption=f"{stage}_example_render")
+                    challenge_rgb = wandb.Image(rgb_nv_wandb, caption=f"{stage}_challenge_rgb")
+                    challenge_depth = wandb.Image(depth_viz, caption=f"{stage}_challenge_depth")
+
+                    print(f"Logging to W&B: {rgb_nv_wandb.shape}, type: {rgb_nv_wandb.dtype}")
+                    print(f"Logging to W&B: {depth_viz.shape}, type: {depth_viz.dtype}")
+                    wandb.log({
+                        **formatted_stats,
+                        f"{stage}_example_render": example_image,
+                        f"{stage}_challenge_rgb": challenge_rgb,
+                        f"{stage}_challenge_depth": challenge_depth
+                    }, step=step)
 
     @torch.no_grad()
     def render_traj(self, step: int):
