@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --partition=gpu 
 #SBATCH --mem=25G
-#SBATCH --time 02:00:00
+#SBATCH --time 6:00:00
 
 echo "Running job: $SLURM_JOB_ID"
 echo "Running on node: $SLURM_NODELIST"

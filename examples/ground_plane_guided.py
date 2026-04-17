@@ -612,7 +612,7 @@ def get_depth_lambda_schedule(
     if strategy == "progressive":
         # Phase 1 (0-25%): Minimal depth supervision, focus on color
         if step < max_steps * 0.25:
-            return lambda_base * 0.1
+            return lambda_base * 0.2
         # Phase 2 (25-70%): Rap up depth as reconstruction stabilizes
         elif step < max_steps * 0.70:
             progress = (step - max_steps * 0.25) / (max_steps * 0.45)

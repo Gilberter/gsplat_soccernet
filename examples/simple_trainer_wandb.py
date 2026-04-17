@@ -56,7 +56,7 @@ from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss, get_depth_lambda_schedule
+from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss,  get_depth_lambda_schedule 
 
 from utils_eval_challenge import load_challenges,save_outputs,render_camera, load_splats, save_outputs_canvas, delete_image
 
