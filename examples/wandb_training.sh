@@ -311,6 +311,32 @@ mkdir -p ./logs
 LOG_FILE="$OUTPUT_DIR/experiment_log.txt"
 CONFIG_FILE="$OUTPUT_DIR/config.txt"
 
+print_header "COMPUTING SAVE INTERVALS AT 15%"
+
+# Calculate steps for 15%, 30%, 45%, 60%, 75%, 90%, 100%
+SAVE_STEP_1=$(( MAX_STEPS * 15 / 100 - 1 ))
+SAVE_STEP_2=$(( MAX_STEPS * 30 / 100 - 1 ))
+SAVE_STEP_3=$(( MAX_STEPS * 45 / 100 - 1 ))
+SAVE_STEP_4=$(( MAX_STEPS * 60 / 100 - 1 ))
+SAVE_STEP_5=$(( MAX_STEPS * 75 / 100 - 1 ))
+SAVE_STEP_6=$(( MAX_STEPS * 90 / 100 - 1 ))
+SAVE_STEP_7=$(( MAX_STEPS - 1 ))
+
+# Clamp to valid range
+[ $SAVE_STEP_1 -lt 0 ] && SAVE_STEP_1=0
+[ $SAVE_STEP_2 -lt 0 ] && SAVE_STEP_2=$(( MAX_STEPS / 2 ))
+[ $SAVE_STEP_3 -lt 0 ] && SAVE_STEP_3=$(( MAX_STEPS / 3 ))
+
+SAVE_STEPS="$SAVE_STEP_1 $SAVE_STEP_2 $SAVE_STEP_3 $SAVE_STEP_4 $SAVE_STEP_5 $SAVE_STEP_6 $SAVE_STEP_7"
+
+print_info "Save steps calculated:"
+echo "   15% → Step $SAVE_STEP_1"
+echo "   30% → Step $SAVE_STEP_2"
+echo "   45% → Step $SAVE_STEP_3"
+echo "   60% → Step $SAVE_STEP_4"
+echo "   75% → Step $SAVE_STEP_5"
+echo "   90% → Step $SAVE_STEP_6"
+  100% → Step $SAVE_STEP_7""
 
 {
     print_header "EXPERIMENT CONFIGURATION"
@@ -386,7 +412,7 @@ FLAGS="$FLAGS --max_refine_steps $MAX_REFINE_STEPS"
 FLAGS="$FLAGS --wandb_path_challenge $WANDB_PATH_CHALLENGE"
 
 
-
+FLAGS="$FLAGS --save_steps $SAVE_STEPS"
 
 # Add conditional flags
 if [ "$ABSGRAD" = true ]; then
@@ -481,14 +507,50 @@ CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt"
 REPO_ROOT="/home/hensemberk/dev/Soccernet/gsplat"
 
 
-if [ -f "$CKPT" ]; then
-    print_info "Checkpoint found: $(basename $CKPT)"
+
+print_section "CHECKPOINT MANAGEMENT"
+
+CKPT_SRC_DIR="$RESULT_DIR/ckpts"  
+CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
+
+mkdir -p "$CKPT_DEST_DIR"
+
+print_info "Source checkpoint directory: $CKPT_SRC_DIR"
+print_info "Destination checkpoint directory: $CKPT_DEST_DIR"
+
+if compgen -G "$CKPT_SRC_DIR/ckpt_*.pt" > /dev/null 2>&1; then
+    print_info "Found training checkpoints. Copying all..."
+    
+    CKPT_COUNT=0
+    for ckpt_file in "$CKPT_SRC_DIR"/ckpt_*.pt; do
+        cp "$ckpt_file" "$CKPT_DEST_DIR/" && {
+            CKPT_COUNT=$((CKPT_COUNT + 1))
+            print_info "  [$(basename "$ckpt_file")] ✓"
+        } || {
+            print_error "Failed to copy $(basename "$ckpt_file")"
+        }
+    done
+    
+    print_info "Total checkpoints copied: $CKPT_COUNT"
+    
+    # Get the latest checkpoint for evaluation
+    LATEST_CKPT=$(ls -t "$CKPT_DEST_DIR"/ckpt_*.pt 2>/dev/null | head -1)
+    
+else
+    print_warning "No checkpoints found in $CKPT_SRC_DIR"
+    LATEST_CKPT=""
+fi
+
+
+
+if [ -f "$LATEST_CKPT" ]; then
+    print_info "Checkpoint found: $(basename $LATEST_CKPT)"
 
     # ── 1. Run evaluation (outputs go to OUTPUT_DIR inside CHALLENGE_DIR) ──
     print_header "RUNNING EVALUATION"
 
     srun python "$REPO_ROOT/examples/eval_challenge.py" \
-        --ckpt "$CKPT" \
+        --ckpt "$LATEST_CKPT" \
         --data_dir "$CHALLENGE_DIR" \
         --result_folder "$OUTPUT_DIR" \
         --specific \

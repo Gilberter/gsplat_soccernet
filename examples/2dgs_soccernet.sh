@@ -1,36 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=soccernet
-#SBATCH --output=./logs/train_%j.out
+#SBATCH --job-name=soccernet_2dgs
+#SBATCH --output=./logs/train_2dgs_%j.out
 #SBATCH --account=soccernet_nvs
-#SBATCH --error=./logs/error_%j.log
+#SBATCH --error=./logs/error_2dgs_%j.log
 #SBATCH --cpus-per-task=10
 #SBATCH --partition=gpu
 #SBATCH --mem=20G
 #SBATCH --time 02:00:00
-
-################################################################################
-# GSPLAT Training Script with Organized Experiment Structure
-# ============================================================================
-# Usage:
-#   bash train_experiment.sh SCENE DENSIFICATION [FLAGS]
-#
-# Arguments:
-#   SCENE           : Scene name (required)
-#   DENSIFICATION   : 'classic' or 'mcmc' (required)
-#   FLAGS:
-#     --absgrad                Enable absolute gradients
-#     --antialiased            Enable antialiased rasterization
-#     --app-opt                Enable appearance optimization
-#     --bilateral              Enable bilateral grid post-processing
-#     --data-factor N          Downsample factor (default: 1)
-#     --max-steps N            Max training steps (default: 40000)
-#     --colmap-dir PATH        Path to COLMAP sparse folder
-#     --data-dir PATH          Path to dataset
-#
-# Examples:
-#   bash train_experiment.sh soccernet classic --absgrad --bilateral
-#   bash train_experiment.sh garden mcmc --bilateral --data-factor 2
-################################################################################
 
 set -e
 
@@ -74,99 +50,82 @@ if [ $# -lt 2 ]; then
     print_error "Not enough arguments"
     echo "Usage: SCENE DENSIFICATION [FLAGS]"
     echo "  SCENE: Scene name (e.g., soccernet)"
-    echo "  DENSIFICATION: 'classic' or 'mcmc'"
     echo ""
     echo "Flags:"
-    echo "  --absgrad               Enable absolute gradients"
-    echo "  --antialiased           Enable antialiased rasterization"
-    echo "  --app-opt               Enable appearance optimization"
-    echo "  --post-processing {bilateral_grid,ppisp}      Enable bilateral grid post-processing"
-    echo "  --data-factor N         Downsample factor (default: 1)"
+    echo "  --data-factor N         Downsample factor (default: 2)"
     echo "  --max-steps N           Max steps (default: 40000)"
     echo "  --colmap-dir PATH       Path to COLMAP sparse folder"
     echo "  --data-dir PATH         Path to dataset"
-    echo "  --packed                Enable Packed Mode"
+    echo "  --depth-loss            Enable depth loss with DA3"
+    echo "  --depth-ground          Enable ground-plane prior"
+    echo "  --use-controller        Enable PPISP controller"
+    echo "  --ssim-lambda N         SSIM weight (default: 0.2)"
+    echo "  --wandb-steps N         W&B eval frequency (default: 1000)"
     exit 1
 fi
 
 SCENE=$1
-DENSIFICATION=$2
-shift 2
+shift 1
 
-# Validate densification type
-if [[ ! "$DENSIFICATION" =~ ^(classic|mcmc)$ ]]; then
-    print_error "DENSIFICATION must be 'classic' or 'mcmc', got: $DENSIFICATION"
-    exit 1
-fi
 
 # ============================================================================
-# DEFAULT PARAMETERS (Can be overridden by flags)
+# DEFAULT PARAMETERS
 # ============================================================================
 
-# Feature flags
+# 2DGS-specific features
+DEPTH_LOSS=false
+DEPTH_GROUND=false
+NORMAL_LOSS=false
+DIST_LOSS=false
 ABSGRAD=false
-ANTIALIASED=false
 APP_OPT=false
-BILATERAL=false
-PPISP=false
-PACKED=false
+
 
 # Hyperparameters
 DATA_FACTOR=2
 MAX_STEPS=40000
+MAX_REFINE_STEPS=25000
 OPACITY_REG=0.01
 SCALE_REG=0.01
-APP_EMBED_DIM=64
-FEATURE_DIM=32
-GROW_GRAD2D=0.0008
 SSIM_LAMBDA=0.2
 
-# Bilateral grid parameters
-BILATERAL_SHAPE_X=16
-BILATERAL_SHAPE_Y=16
-BILATERAL_SHAPE_W=8
-
-# Paths (set defaults, can be overridden)
+# Paths
 DATA_DIR="/disk/SN-NVS-2026-raw/${SCENE}"
 COLMAP_DIR="/disk/SN-NVS-2026-raw/${SCENE}/sparse/0"
 CHALLENGE_DIR="/disk/SN-NVS-2026-raw/${SCENE}-challenge"
+GROUND_DIR="/disk/SN-NVS-2026-raw/${SCENE}/mask/masks"
+DEPTH_DIR="${DATA_DIR}/dae3/DA3MONO-LARGE/depth_maps.npz"
+
+# W&B config
+USE_WANDB=true
+WANDB_STEPS_EVAL=1000
+WANDB_RUN_NAME=""
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --absgrad)
-            ABSGRAD=true
+        --depth-loss)
+            DEPTH_LOSS=true
             shift
             ;;
-        --antialiased)
-            ANTIALIASED=true
+        --absgrad)
+            ABSGRAD=true
             shift
             ;;
         --app-opt)
             APP_OPT=true
             shift
             ;;
-        --post-processing)
-            case $2 in
-                bilateral*) # Matches bilateral or bilateral_grid
-                    BILATERAL=true ;;
-                ppisp)
-                    PPISP=true ;;
-                *)
-                    echo "Warning: Unknown post-processing method '$2'" ;;
-            esac
-            shift 2
-            ;;
         --data-factor)
             DATA_FACTOR=$2
             shift 2
             ;;
-        --ssim-lambda)
-            SSIM_LAMBDA=$2
-            shift 2
-            ;;
         --max-steps)
             MAX_STEPS=$2
+            shift 2
+            ;;
+        --max-refine)
+            MAX_REFINE_STEPS=$2
             shift 2
             ;;
         --opacity-reg)
@@ -177,36 +136,29 @@ while [[ $# -gt 0 ]]; do
             SCALE_REG=$2
             shift 2
             ;;
+        --ssim-lambda)
+            SSIM_LAMBDA=$2
+            shift 2
+            ;;
         --data-dir)
             DATA_DIR=$2
+            shift 2
+            ;;
+        --normal-loss) 
+            NORMAL_LOSS=$2
+            shift 2
+            ;;
+        --dist-loss) 
+            DIST_LOSS=$2
             shift 2
             ;;
         --colmap-dir)
             COLMAP_DIR=$2
             shift 2
             ;;
-        --feature-dim)
-            FEATURE_DIM=$2
+        --wandb-steps)
+            WANDB_STEPS_EVAL=$2
             shift 2
-            ;;
-        --app-embed-dim)
-            APP_EMBED_DIM=$2
-            shift 2
-            ;;
-
-        --grow-grad2d)
-            GROW_GRAD2D=$2
-            shift 2
-            ;;
-        --packed)
-            PACKED=true
-            shift
-            ;;
-        --bilateral-shape)
-            BILATERAL_SHAPE_X=$2
-            BILATERAL_SHAPE_Y=$3
-            BILATERAL_SHAPE_W=$4
-            shift 4
             ;;
         *)
             print_warning "Unknown flag: $1"
@@ -216,68 +168,34 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ============================================================================
-# GENERATE OUTPUT FOLDER NAME (Meaningful & Organized)
+# BUILD FEATURE NAME & OUTPUT DIRECTORIES
 # ============================================================================
 
-# Build folder structure: DENSIFICATION / FEATURES / SPECIFIC_CONFIG
 FEATURES=()
 
-## ADD FEATURES TO ADD TO THE NAME OF THE FOLDER
-if [ "$ABSGRAD" = true ]; then
-    FEATURES+=("absgrad")
+if [ "$DEPTH_LOSS" = true ]; then
+    FEATURES+=("depthloss")
 fi
 
-if [ "$ANTIALIASED" = true ]; then
-    FEATURES+=("antialiased")
+if [ "$DEPTH_GROUND" = true ]; then
+    FEATURES+=("groundprior")
 fi
 
-if [ "$APP_OPT" = true ]; then
-    FEATURES+=("appopt")
-fi
-
-if [ "$PPISP" = true ]; then
-    FEATURES+=("ppisp")
-fi
-
-if [ "$BILATERAL" = true ]; then
-    FEATURES+=("bilateral")
-fi
-
-if [ "$PACKED" = true ]; then
-    FEATURES+=("packed")
-fi
-
-
-# If no features, use baseline
+# Always add 2DGS to feature name
 if [ ${#FEATURES[@]} -eq 0 ]; then
-    FEATURES=("baseline")
+    FEATURE_NAME="2dgs_baseline"
+else
+    FEATURE_NAME="2dgs_$(IFS=_; echo "${FEATURES[*]}")"
 fi
 
-FEATURE_NAME=$(IFS=_; echo "${FEATURES[*]}")
-
-# Generate configuration suffix based on non-default parameters
 CONFIG_SUFFIX=""
 if [ "$MAX_STEPS" != "40000" ]; then
     CONFIG_SUFFIX="${CONFIG_SUFFIX}_s${MAX_STEPS}"
 fi
 
-# ============================================================================
-# DIRECTORIES
-# ============================================================================
-#
-# RESULT_DIR  → temporary folder used only during training to hold the
-#               checkpoint produced by simple_trainer.py.  It is deleted
-#               after a successful eval so that storage is not wasted.
-#
-# OUTPUT_DIR  → permanent folder inside CHALLENGE_DIR where eval_challenge.py
-#               writes its outputs.  The checkpoint is also copied here so
-#               everything (ckpt + eval artefacts + logs) lives in one place.
-#
-# ============================================================================
+OUTPUT_BASE_DIR="${CHALLENGE_DIR}/${SCENE}/${FEATURE_NAME}${CONFIG_SUFFIX}"
 
-OUTPUT_BASE_DIR="${CHALLENGE_DIR}/${SCENE}/${DENSIFICATION}/${FEATURE_NAME}${CONFIG_SUFFIX}"
-
-# Handle multiple runs (run1, run2, etc.)
+# Handle multiple runs
 if [ -d "$OUTPUT_BASE_DIR" ]; then
     i=1
     while [ -d "${OUTPUT_BASE_DIR}_run${i}" ]; do
@@ -290,8 +208,11 @@ else
     RUN_NUM=0
 fi
 
-# Temporary training directory – lives in /tmp and is cleaned up after eval
-RESULT_DIR="/tmp/gsplat_train_${SCENE}_${DENSIFICATION}_${FEATURE_NAME}${CONFIG_SUFFIX}_run${RUN_NUM}"
+RESULT_DIR="/tmp/gsplat_2dgs_train_${SCENE}_${DENSIFICATION}_${FEATURE_NAME}${CONFIG_SUFFIX}_run${RUN_NUM}"
+WANDB_RUN_NAME="${SCENE}_2dgs_${DENSIFICATION}_${FEATURE_NAME}_run${RUN_NUM}"
+WANDB_PATH_CHALLENGE="${CHALLENGE_DIR}/sparse/0"
+
+
 
 cleanup_on_failure() {
     local exit_code=$?
@@ -318,22 +239,22 @@ mkdir -p "$RESULT_DIR"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p ./logs
 
+LOG_FILE="$OUTPUT_DIR/experiment_log.txt"
+CONFIG_FILE="$OUTPUT_DIR/config.txt"
+
 # ============================================================================
 # LOG CONFIGURATION
 # ============================================================================
 
-# Logs are written to OUTPUT_DIR so they end up in the permanent location
-LOG_FILE="$OUTPUT_DIR/experiment_log.txt"
-CONFIG_FILE="$OUTPUT_DIR/config.txt"
-
 {
-    print_header "EXPERIMENT CONFIGURATION"
+    print_header "2DGS EXPERIMENT CONFIGURATION"
 
     echo ""
     echo "📋 EXPERIMENT IDENTITY"
     printf "%-30s %s\n" "Scene:" "$SCENE"
+    printf "%-30s %s\n" "Model:" "2DGS (2D Gaussian Splatting)"
     printf "%-30s %s\n" "Densification:" "$DENSIFICATION"
-    printf "%-30s %s\n" "Feature Set:" "$FEATURE_NAME"
+    printf "%-30s %s\n" "Features:" "$FEATURE_NAME"
     printf "%-30s %s\n" "Run Number:" "$RUN_NUM"
 
     echo ""
@@ -341,28 +262,18 @@ CONFIG_FILE="$OUTPUT_DIR/config.txt"
     printf "%-30s %s\n" "Max Steps:" "$MAX_STEPS"
     printf "%-30s %s\n" "Data Factor:" "$DATA_FACTOR"
     printf "%-30s %s\n" "Batch Size:" "1"
-    printf "%-30s %s\n" "SH Degree:" "3"
-    printf "%-30s %s\n" "PACKED:" "$PACKED"
-    printf "%-30s %s\n" "SSIM_LAMBDA:" "$SSIM_LAMBDA"
-
+    printf "%-30s %s\n" "SSIM Lambda:" "$SSIM_LAMBDA"
 
     echo ""
-    echo "🎯 FEATURES ENABLED"
-    [ "$ABSGRAD" = true ]     && printf "%-30s %s\n" "Absgrad:"       "✓ ON" || printf "%-30s %s\n" "Absgrad:"       "✗ OFF"
-    [ "$ANTIALIASED" = true ] && printf "%-30s %s\n" "Antialiased:"   "✓ ON" || printf "%-30s %s\n" "Antialiased:"   "✗ OFF"
-    [ "$APP_OPT" = true ]     && printf "%-30s %s\n" "App Opt:"       "✓ ON" || printf "%-30s %s\n" "App Opt:"       "✗ OFF"
-    [ "$BILATERAL" = true ]   && printf "%-30s %s\n" "Bilateral Grid:" "✓ ON" || printf "%-30s %s\n" "Bilateral Grid:" "✗ OFF"
-    [ "$PPISP" = true ]       && printf "%-30s %s\n" "PPISP:"         "✓ ON" || printf "%-30s %s\n" "PPISP:"         "✗ OFF"
+    echo "🎯 2DGS-SPECIFIC FEATURES"
+    [ "$DEPTH_LOSS" = true ]     && printf "%-30s %s\n" "Depth Loss (DA3):" "✓ ON" || printf "%-30s %s\n" "Depth Loss (DA3):" "✗ OFF"
+    [ "$DEPTH_GROUND" = true ]   && printf "%-30s %s\n" "Ground Plane Prior:" "✓ ON" || printf "%-30s %s\n" "Ground Plane Prior:" "✗ OFF"
+    [ "$USE_CONTROLLER" = true ] && printf "%-30s %s\n" "PPISP Controller:" "✓ ON" || printf "%-30s %s\n" "PPISP Controller:" "✗ OFF"
 
     echo ""
     echo "📊 HYPERPARAMETERS"
-    printf "%-30s %s\n" "Opacity Reg:" "$OPACITY_REG"
-    printf "%-30s %s\n" "Scale Reg:" "$SCALE_REG"
-    printf "%-30s %s\n" "Feature Dim:" "$FEATURE_DIM"
-    printf "%-30s %s\n" "App Embed Dim:" "$APP_EMBED_DIM"
-    [ "$ABSGRAD" = true ]   && printf "%-30s %s\n" "Grow Grad2D:" "$GROW_GRAD2D"
-    [ "$BILATERAL" = true ] && printf "%-30s %s\n" "Bilateral Grid Shape:" "($BILATERAL_SHAPE_X, $BILATERAL_SHAPE_Y, $BILATERAL_SHAPE_W)"
-    [ "$PPISP" = true ]     && printf "%-30s %s\n" "PPISP:" "✓ ON" || printf "%-30s %s\n" "PPISP:" "✗ OFF"
+    printf "%-30s %s\n" "Opacity Regularization:" "$OPACITY_REG"
+    printf "%-30s %s\n" "Scale Regularization:" "$SCALE_REG"
 
     echo ""
     echo "📂 PATHS"
@@ -390,45 +301,35 @@ FLAGS="$FLAGS --disable_viewer"
 FLAGS="$FLAGS --data_factor $DATA_FACTOR"
 FLAGS="$FLAGS --opacity_reg $OPACITY_REG"
 FLAGS="$FLAGS --scale_reg $SCALE_REG"
-FLAGS="$FLAGS --feature_dim $FEATURE_DIM"
 FLAGS="$FLAGS --max_steps $MAX_STEPS"
 FLAGS="$FLAGS --ssim_lambda $SSIM_LAMBDA"
 
-# Add conditional flags
+
+# FLAGS="$FLAGS --wandb_run_name $WANDB_RUN_NAME"
+# FLAGS="$FLAGS --wandb_steps $WANDB_STEPS_EVAL"
+# FLAGS="$FLAGS --max_refine_steps $MAX_REFINE_STEPS"
+# FLAGS="$FLAGS --wandb_path_challenge $WANDB_PATH_CHALLENGE"
+
+# Add 2DGS-specific flags
+
 if [ "$ABSGRAD" = true ]; then
-    FLAGS="$FLAGS --strategy.absgrad --absgrad --strategy.grow_grad2d $GROW_GRAD2D"
+    FLAGS="$FLAGS --absgrad"
 fi
 
-if [ "$ANTIALIASED" = true ]; then
-    FLAGS="$FLAGS --antialiased"
+if [ "$DEPTH_LOSS" = true ]; then
+    FLAGS="$FLAGS --depth_loss"
+    FLAGS="$FLAGS --mini_depth_dir $DEPTH_DIR"
 fi
 
-if [ "$APP_OPT" = true ]; then
-    FLAGS="$FLAGS --app_opt --app_embed_dim $APP_EMBED_DIM"
+if [ "$DIST_LOSS" = true ]; then
+    FLAGS="$FLAGS --dist_loss"
 fi
 
-if [ "$BILATERAL" = true ]; then
-    FLAGS="$FLAGS --post_processing bilateral_grid --bilateral_grid_fused"
-    FLAGS="$FLAGS --bilateral_grid_shape $BILATERAL_SHAPE_X $BILATERAL_SHAPE_Y $BILATERAL_SHAPE_W"
+if [ "$NORMAL_LOSS" = true ]; then
+    FLAGS="$FLAGS --normal_loss"
 fi
 
-if [ "$PPISP" = true ]; then
-    FLAGS="$FLAGS --post_processing ppisp"
-fi
 
-# ============================================================================
-# SELECT DENSIFICATION STRATEGY
-# ============================================================================
-
-if [ "$DENSIFICATION" = "mcmc" ]; then
-    DENSIFICATION_CMD="mcmc"
-else
-    DENSIFICATION_CMD="default"
-fi
-
-# ============================================================================
-# CHECK GPU SETUP
-# ============================================================================
 
 print_header "GPU ENVIRONMENT CHECK"
 
@@ -447,45 +348,50 @@ if torch.cuda.is_available():
 "
 
 # ============================================================================
-# TRAINING
+# TRAINING WITH 2DGS
 # ============================================================================
 
-print_header "STARTING TRAINING"
+print_header "STARTING 2DGS TRAINING"
 print_info "Scene: $SCENE"
+print_info "Model: 2D Gaussian Splatting"
 print_info "Densification: $DENSIFICATION"
 print_info "Features: $FEATURE_NAME"
 print_info "Temp output: $RESULT_DIR"
 
 START_TIME=$(date +%s)
 
-srun python "$REPO_ROOT/examples/simple_trainer.py" "$DENSIFICATION_CMD" \
+# Use simple_trainer_2dgs.py instead of simple_trainer.py
+srun python "$REPO_ROOT/examples/simple_trainer_2dgs.py" \
     --data_dir "$DATA_DIR" \
     --result_dir "$RESULT_DIR" \
     --colmap_dir "$COLMAP_DIR" \
     --no-normalize_world_space \
-    --no-load_exposure \
     --test_every 0 \
     --save_steps 10000 20000 30000 40000 \
     $FLAGS \
     2>&1 | tee -a "$LOG_FILE"
 
+TRAIN_EXIT=${PIPESTATUS[0]}
+echo "Training exit code: $TRAIN_EXIT"
+
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
 # ============================================================================
-# POST-TRAINING: EVAL + COPY CKPT + CLEANUP TEMP DIR
+# POST-TRAINING: EVAL + COPY CKPT + CLEANUP
 # ============================================================================
 
 print_header "TRAINING COMPLETED"
 print_info "Duration: $((DURATION / 60)) minutes ($DURATION seconds)"
+print_info "Model: 2D Gaussian Splatting"
 
-CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt"
+CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1)).pt"
 
 if [ -f "$CKPT" ]; then
     print_info "Checkpoint found: $(basename $CKPT)"
 
-    # ── 1. Run evaluation (outputs go to OUTPUT_DIR inside CHALLENGE_DIR) ──
-    print_header "RUNNING EVALUATION"
+    # ── 1. Run evaluation ──
+    print_header "RUNNING 2DGS EVALUATION"
 
     srun python "$REPO_ROOT/examples/eval_challenge.py" \
         --ckpt "$CKPT" \
@@ -494,48 +400,55 @@ if [ -f "$CKPT" ]; then
         --specific \
         2>&1 | tee -a "$LOG_FILE"
 
-    # ── 2. Copy the checkpoint into OUTPUT_DIR so everything is together ──
+    # ── 2. Copy checkpoint ──
     CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
     mkdir -p "$CKPT_DEST_DIR"
     cp "$CKPT" "$CKPT_DEST_DIR/"
     print_info "Checkpoint copied to: $CKPT_DEST_DIR/$(basename $CKPT)"
 
+    # ── 3. Cleanup temp directory ──
+    if [ $TRAIN_EXIT -eq 0 ]; then
+        echo "🧹 Removing temp training directory: $RESULT_DIR"
+        rm -rf "$RESULT_DIR" && echo "✓ Temp directory removed" || echo "⚠ Failed to remove temp dir"
+    fi
+
     # ── 3. Delete the temporary training directory ──
     rm -rf "$RESULT_DIR"
     print_info "Temp training directory removed: $RESULT_DIR"
 
+
 else
     print_warning "Checkpoint not found at: $CKPT"
-    print_warning "Skipping eval and temp-dir cleanup."
+    print_warning "Skipping eval and cleanup."
 fi
 
 # ============================================================================
-# GENERATE SUMMARY  (saved to OUTPUT_DIR alongside logs + ckpt)
+# GENERATE SUMMARY
 # ============================================================================
 
 SUMMARY_FILE="$OUTPUT_DIR/SUMMARY.md"
 
 cat > "$SUMMARY_FILE" << EOF
-# Experiment Summary
+# 2D Gaussian Splatting (2DGS) Experiment Summary
 
 ## Configuration
 - **Scene**: $SCENE
+- **Model**: 2D Gaussian Splatting (Surfel-based)
 - **Densification**: $DENSIFICATION
 - **Features**: $FEATURE_NAME
 - **Run**: ${RUN_NUM}
+
+## 2DGS-Specific Features
+- **Depth Loss (DA3)**: $DEPTH_LOSS
+- **Ground Plane Prior**: $DEPTH_GROUND
+- **PPISP Controller**: $USE_CONTROLLER
 
 ## Parameters
 - **Max Steps**: $MAX_STEPS
 - **Data Factor**: $DATA_FACTOR
 - **Opacity Reg**: $OPACITY_REG
 - **Scale Reg**: $SCALE_REG
-
-## Features Enabled
-- Absgrad: $ABSGRAD
-- Antialiased: $ANTIALIASED
-- App Opt: $APP_OPT
-- Bilateral Grid: $BILATERAL
-- PPISP: $PPISP
+- **SSIM Lambda**: $SSIM_LAMBDA
 
 ## Results
 - **Start Time**: $(date -d @$START_TIME '+%Y-%m-%d %H:%M:%S')
@@ -544,13 +457,30 @@ cat > "$SUMMARY_FILE" << EOF
 - **Output Dir**: $OUTPUT_DIR
 - **Checkpoint**: $CKPT_DEST_DIR/$(basename $CKPT)
 
+## Model Details
+2D Gaussian Splatting represents scenes using 2D Gaussian surfels lying on
+ground planes, rather than 3D Gaussians floating in space. This is particularly
+suited for:
+- Ground-plane constrained scenes (sports fields, streets)
+- Normal estimation (floor detection, planar surfaces)
+- Efficient geometry supervision
+
 ## Paths
 - Data: $DATA_DIR
 - COLMAP: $COLMAP_DIR
 - Challenge: $CHALLENGE_DIR
+- Depth Dir: $DEPTH_DIR
+
+## References
+- 2DGS Paper: https://github.com/hbb1/2d-gaussian-splatting
+- gsplat 2DGS Implementation: https://github.com/nerfstudio-project/gsplat
 EOF
 
 print_info "Summary saved to: $SUMMARY_FILE"
 
 echo ""
-print_header "✅ EXPERIMENT FINISHED SUCCESSFULLY"
+if [ $TRAIN_EXIT -eq 0 ]; then
+    print_header "✅ 2DGS TRAINING FINISHED SUCCESSFULLY"
+else
+    print_header "❌ 2DGS TRAINING FAILED (exit code: $TRAIN_EXIT)"
+fi

@@ -1,103 +1,3 @@
-"""
-ground_plane_losses.py
-======================
-Three-level depth supervision strategy for soccer field Gaussian Splatting.
-
-WHY THREE LEVELS:
-─────────────────
-  Level 1 — DA3 dense metric depth (direct image comparison)
-             Supervises EVERY pixel. Gradient flows through the full
-             alpha-blended rendered depth map.  Corrects the whole pitch.
-
-  Level 2 — Geometric ground-plane prior (Zw=0 plane intersection)
-             Supervises only SAM-masked GROUND pixels.  Pure geometry —
-             no learned component, no scale ambiguity.  Enforces the flat
-             Zw=0 constraint on floor Gaussians specifically.
-
-  Level 3 — 2DGS normal consistency (from simple_trainer_2dgs.py)
-             Forces floor disk normals to align with the depth gradient.
-             On a flat floor the depth gradient is zero → disks must point
-             straight up → they LIE IN the Zw=0 plane.
-             This is the mechanism that prevents green Gaussians drifting
-             in front of players.
-
-WHAT WAS WRONG WITH THE ORIGINAL depth_supervision_loss:
-─────────────────────────────────────────────────────────
-  The original function receives D_pred with shape [..., C, N] where N
-  is the number of Gaussians — NOT a pixel image.  It uses means2d to
-  sample D_gt at Gaussian centres and compares the per-Gaussian camera-
-  space z-depth (Zc) against the geometric prior sampled at the same pixel.
-
-  Problems:
-    1. Zc is the Gaussian's own camera-space z — it ignores all the
-       alpha-blending that the rasterizer does.  A Gaussian at Zc=5.0
-       may render to a pixel at depth 4.6 because closer Gaussians
-       partially occlude it.  The loss is comparing the wrong quantity.
-    2. It has no gradient signal for Gaussians that project to pixels
-       where D_gt=0 (non-ground pixels), even if those Gaussians float
-       above the floor.
-    3. The correct rendered depth — what we actually see — is in
-       depths_image [C, H, W, 1], the alpha-normalized expected depth
-       that comes out of rasterization with render_mode="RGB+ED".
-
-  The fix: compare depths_image directly against D_gt_map (same shape,
-  both [C, H, W]).  Gradient flows through the rasterizer's backward
-  pass and is correctly distributed over all contributing Gaussians.
-
-ALPHA-BLENDED DEPTH — WHY IT'S BETTER:
-────────────────────────────────────────
-  The 2DGS paper (eq. 18) defines:
-
-       z_mean = Σᵢ(ωᵢ · zᵢ) / (Σᵢ(ωᵢ) + ε)
-
-  where ωᵢ = Tᵢ · αᵢ · Ĝᵢ(u(x)) is the blending weight of the i-th
-  Gaussian at pixel x, and Tᵢ is the accumulated transmittance.
-
-  This is exactly what gsplat returns in the last channel of render_colors
-  when render_mode="RGB+ED" (Expected Depth).  The gradient of L1/MSE
-  on this quantity with respect to means flows back to every Gaussian
-  that has non-zero weight at any supervised pixel — correctly pulling
-  each floor Gaussian toward the right depth proportional to its weight.
-
-  The per-Gaussian Zc approach only moves one Gaussian at a time and
-  ignores the collective rendering.
-
-HOW THE GREEN-GAUSSIAN PROBLEM IS SOLVED:
-──────────────────────────────────────────
-  Green Gaussians appear in front of players because:
-    (a) The color loss sees green grass through transparent players.
-    (b) The optimizer places a green Gaussian at depth z_player to
-        explain the residual green tint — it's cheaper than making
-        the player Gaussian perfectly opaque.
-
-  The three-level depth supervision prevents this:
-    (a) Level 1 (DA3): the rendered depth at every player pixel must
-        match the DA3 depth of the player surface.  A green Gaussian
-        floating at player depth would make the rendered depth too
-        shallow — the L1 loss pulls it back to the correct depth.
-    (b) Level 2 (Zw=0 prior): only activates on SAM-masked ground pixels,
-        so it does not directly constrain player Gaussians.  But it
-        keeps floor Gaussians firmly at z_floor, which means the optimizer
-        cannot place a floor Gaussian above z_floor to explain a green
-        pixel at player depth.
-    (c) Level 3 (normal consistency): floor disks are forced flat.  A
-        disk lying in Zw=0 cannot have a component pointing toward the
-        camera, so it cannot "see" any player pixel.  Its colour signal
-        comes only from floor-facing pixels.
-
-USAGE:
-──────
-  In simple_trainer_guided.py replace the ground_loss block with:
-
-      from ground_plane_losses import (
-          depth_from_da3_loss,
-          ground_plane_prior_loss,
-          build_ground_depth_map,
-      )
-
-  See each function's docstring for the exact call signature and where
-  in the training loop to place it.
-"""
 
 import math
 from typing import Optional, Tuple
@@ -623,7 +523,7 @@ def get_depth_lambda_schedule(
     
     elif strategy == "cosine_warmup":
         # Smooth cosine annealing
-        warmup_steps = max_steps * 0.1
+        warmup_steps = max_steps * 0.5
         if step < warmup_steps:
             return lambda_base * (1 - torch.cos(torch.tensor(np.pi * step / warmup_steps))) / 2
         return lambda_base
@@ -882,20 +782,20 @@ Implements Algorithm 1 from:
   "Scene-Constrained Neural Radiance Fields for High-Quality Sports Scene
    Rendering Based on Visual Sensor Network" (Dai et al. 2024)
 
-and the scale-alignment utility from eqs. (15–16) used with DA3 depth maps.
+and the scale-alignment utility from eqs. (15-16) used with DA3 depth maps.
 
 Public API
 ----------
-  quat_to_rotmat            — quaternion → 3×3 rotation
+  quat_to_rotmat            — quaternion → 3x3 rotation
   quat_scale_to_covar       — (q, s) → 3D covariance Σ
   world_to_cam              — world-space Gaussians → camera space
   persp_proj                — EWA perspective projection → 2D
-  isect_tiles               — Gaussian–tile intersection list
+  isect_tiles               — Gaussian-tile intersection list
   isect_offset_encode       — per-tile start-index lookup table
   cam2world_ground          — camera rays → Zw=0 world points
   calculate_depth           — Euclidean camera-to-ground-point distance
   ground_plane_depth_guided — full Algorithm 1 pipeline
-  depth_supervision_loss    — pixel-wise Ldist (paper eq. 13–14)
+  depth_supervision_loss    — pixel-wise Ldist (paper eq. 13-14)
   align_depth_scale         — weighted least-squares scale/shift for DA3
 """
 
@@ -914,7 +814,7 @@ from torch import Tensor
 
 def quat_to_rotmat(quats: Tensor) -> Tensor:
     """
-    Quaternion (w, x, y, z) → 3×3 rotation matrix.
+    Quaternion (w, x, y, z) → 3x3 rotation matrix.
     Input  : [..., 4]
     Output : [..., 3, 3]
     """

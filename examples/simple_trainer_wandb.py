@@ -1063,15 +1063,40 @@ class Runner:
                 loss += post_processing_reg_loss
 
             # PROGRESSIVE REGULARIZATION
+            opacities_sig = torch.sigmoid(self.splats["opacities"])  # [N,]
             step_ratio = step / max_steps
+            phase = step_ratio*4
+            # Phase 0 (0-25%):    Weak reg, focus on fitting
+            # Phase 1 (25-50%):   Ramp up opacity penalty
+            # Phase 2 (50-75%):   Strong penalty on mid opacities
+            # Phase 3 (75-100%):  Binary penalty enforcement
+            
+            if phase < 1.0:
+                # Early phase: encourage high density Gaussians
+                opacity_loss_term = torch.clamp(opacities_sig - 0.5, min=0) ** 2
+                opacity_reg_weight = cfg.opacity_reg * 0.1
+            elif phase < 2.0:
+                # Ramp-up phase: transition
+                ramp = (phase - 1.0)
+                opacity_loss_term = torch.clamp(opacities_sig - 0.5, min=0) ** 2
+                opacity_reg_weight = cfg.opacity_reg * (0.1 + 0.9 * ramp)
+            else:
+                # Later phases: strong binary penalty
+                # Penalize opacities near 0.5 (most transparent)
+                # Encourage either very high or very low opacity
+                mid_penalty = torch.exp(-100 * (opacities_sig - 0.5) ** 2)  # [N,]
+                opacity_loss_term = mid_penalty
+                opacity_reg_weight = cfg.opacity_reg
+            
+            if opacity_reg_weight > 0.0:
+                loss += opacity_reg_weight * opacity_loss_term.mean()
+                if step % 500 == 0 and world_rank == 0:
+                    print(f"[Step {step}] Opacity regularization: {(opacity_reg_weight * opacity_loss_term.mean()).item():.6f}")
+
             opacity_reg_weight = cfg.opacity_reg * (0.5 + 0.5 * step_ratio)  # Ramps 0.5x → 1.0x
             scale_reg_weight = cfg.scale_reg * (0.5 + 0.5 * step_ratio)      # Ramps 0.5x → 1.0x
 
 
-
-            # regularizations
-            if opacity_reg_weight > 0.0:
-                loss += opacity_reg_weight * torch.sigmoid(self.splats["opacities"]).mean()
             if scale_reg_weight > 0.0:
                 loss += scale_reg_weight * torch.exp(self.splats["scales"]).mean()
 
@@ -1169,6 +1194,9 @@ class Runner:
 
                 print(f"[Debug] Render range: [{colors.min():.4f}, {colors.max():.4f}]")
                 print(f"[Debug] Loss breakdown: L1={l1loss:.4f}, SSIM={ssimloss:.4f}")
+            
+          
+            
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1201,9 +1229,9 @@ class Runner:
                         data["feature_dim"] = cfg.feature_dim
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
-                )
+                ckpt_path = f"{self.ckpt_dir}/ckpt_{step:06d}_rank{self.world_rank}.pt"
+                torch.save(data, ckpt_path)
+                print(f"✓ Checkpoint saved: {ckpt_path}")
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
