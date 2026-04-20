@@ -523,7 +523,7 @@ def get_depth_lambda_schedule(
     
     elif strategy == "cosine_warmup":
         # Smooth cosine annealing
-        warmup_steps = max_steps * 0.5
+        warmup_steps = max_steps * 0.2
         if step < warmup_steps:
             return lambda_base * (1 - torch.cos(torch.tensor(np.pi * step / warmup_steps))) / 2
         return lambda_base
