@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=sbatch_soccernet
+#SBATCH --job-name=soccernet_nvs
 #SBATCH --output=./logs/colmap_rendering_%j.out
-#SBATCH --account=gs_hyperspectral
+#SBATCH --account=soccernet_nvs
 #SBATCH --error=./logs/error_rendering_%j.log 
 #SBATCH --cpus-per-task=10
 #SBATCH --partition=gpu 
@@ -104,6 +104,9 @@ DEPTH_GROUND=false
 DEPTH_MODEL="DA3MONO-LARGE"
 STRATEGY_DEPTH="progressive"
 SSIM_LAMBDA=0.2
+MAX_GAUSSIANS=1000000
+
+NOISE_LR=500000
 ## wandb
 
 USE_WANDB=true # use wandb
@@ -216,7 +219,10 @@ while [[ $# -gt 0 ]]; do
             STRATEGY_DEPTH=$2
             shift 2
             ;;
-
+        --max-gass)
+            MAX_GAUSSIANS=$2
+            shift 2
+            ;;
         --grow-grad2d)
             GROW_GRAD2D=$2
             shift 2
@@ -313,7 +319,7 @@ CONFIG_FILE="$OUTPUT_DIR/config.txt"
 
 print_header "COMPUTING SAVE INTERVALS AT 15%"
 
-# Calculate steps for 15%, 30%, 45%, 60%, 75%, 90%, 100%
+# Calculate steps for 15,30,45,60,75,100
 SAVE_STEP_1=$(( MAX_STEPS * 15 / 100 - 1 ))
 SAVE_STEP_2=$(( MAX_STEPS * 30 / 100 - 1 ))
 SAVE_STEP_3=$(( MAX_STEPS * 45 / 100 - 1 ))
@@ -336,7 +342,7 @@ echo "   45% → Step $SAVE_STEP_3"
 echo "   60% → Step $SAVE_STEP_4"
 echo "   75% → Step $SAVE_STEP_5"
 echo "   90% → Step $SAVE_STEP_6"
-  100% → Step $SAVE_STEP_7""
+echo "   100% → Step $SAVE_STEP_7"
 
 {
     print_header "EXPERIMENT CONFIGURATION"
@@ -410,6 +416,7 @@ FLAGS="$FLAGS --wandb_steps $WANDB_STEPS_EVAL"
 FLAGS="$FLAGS --ssim_lambda $SSIM_LAMBDA"
 FLAGS="$FLAGS --max_refine_steps $MAX_REFINE_STEPS"
 FLAGS="$FLAGS --wandb_path_challenge $WANDB_PATH_CHALLENGE"
+FLAGS="$FLAGS --max_gaussians $MAX_GAUSSIANS"
 
 
 FLAGS="$FLAGS --save_steps $SAVE_STEPS"
@@ -508,7 +515,6 @@ REPO_ROOT="/home/hensemberk/dev/Soccernet/gsplat"
 
 
 
-print_section "CHECKPOINT MANAGEMENT"
 
 CKPT_SRC_DIR="$RESULT_DIR/ckpts"  
 CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
