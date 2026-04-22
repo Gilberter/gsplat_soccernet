@@ -2141,11 +2141,11 @@ def rasterization_2dgs(
     if render_mode_has_depth_channel(render_mode) and render_mode_has_color(
         render_mode
     ):
-        print(f"SHAPE COLORS {colors.shape} DEPTH SHAPE {depths.shape}")
-        depths =  depths[..., None].unsqueeze(0)
-        print(f"SHAPE COLORS {colors.shape} DEPTH SHAPE {depths.shape}")
+        #print(f"SHAPE COLORS {colors.shape} DEPTH SHAPE {depths.shape}")
+        depths =  depths[..., None]
+        #print(f"SHAPE COLORS {colors.shape} DEPTH SHAPE {depths.shape}")
 
-        colors = torch.cat((colors,), dim=-1)
+        colors = torch.cat((colors, depths), dim=-1)
 
         if backgrounds is not None:
             backgrounds = torch.cat(

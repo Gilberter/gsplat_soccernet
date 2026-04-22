@@ -432,6 +432,33 @@ CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt"
 REPO_ROOT="/home/hensemberk/dev/Soccernet/gsplat"
 
 
+
+print_section "CHECKPOINT MANAGEMENT"
+
+CKPT_SRC_DIR="$RESULT_DIR/ckpts"
+CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
+mkdir -p "$CKPT_DEST_DIR"
+
+if compgen -G "$CKPT_SRC_DIR/ckpt_*.pt" > /dev/null 2>&1; then
+    print_info "Found training checkpoints. Copying all to: $CKPT_DEST_DIR"
+    
+    CKPT_COUNT=0
+    for ckpt_file in "$CKPT_SRC_DIR"/ckpt_*.pt; do
+        cp "$ckpt_file" "$CKPT_DEST_DIR/" && {
+            CKPT_COUNT=$((CKPT_COUNT + 1))
+            print_info "  [$(basename "$ckpt_file")] ✓"
+        } || {
+            print_error "Failed to copy $(basename "$ckpt_file")"
+        }
+    done
+    
+    print_info "Total checkpoints copied: $CKPT_COUNT"
+else
+    print_warning "No checkpoints found in $CKPT_SRC_DIR"
+fi
+
+
+
 if [ -f "$CKPT" ]; then
     print_info "Checkpoint found: $(basename $CKPT)"
 

@@ -251,6 +251,49 @@ def render_camera(means, quats, scales, opacities, colors, sh_degree,
     return render_out.cpu().numpy(), n_rendered
 
 
+def create_three_model_canvas(dir1, dir2, dir3, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+
+    # get filenames from first folder
+    filenames = sorted([
+        f for f in os.listdir(dir1)
+        if f.endswith(".png")
+    ])
+
+    for name in filenames:
+        path1 = os.path.join(dir1, name)
+        path2 = os.path.join(dir2, name)
+        path3 = os.path.join(dir3, name)
+
+        if not (os.path.exists(path2) and os.path.exists(path3)):
+            print(f"Skipping {name} (missing in one folder)")
+            continue
+
+        # ---- load ----
+        img1 = load_and_normalize(path1)
+        img2 = load_and_normalize(path2)
+        img3 = load_and_normalize(path3)
+
+        # ---- optional labels ----
+        img1 = add_label(img1, "Model 1")
+        img2 = add_label(img2, "Model 2")
+        img3 = add_label(img3, "Model 3")
+
+        # ---- match height ----
+        img1, img2, img3 = match_height([img1, img2, img3])
+
+        # ---- concatenate ----
+        canvas = np.concatenate([img1, img2, img3], axis=1)
+
+        # ---- save ----
+        out_path = os.path.join(output_dir, name)
+        imageio.imwrite(
+            out_path,
+            (canvas * 255).clip(0, 255).astype(np.uint8)
+        )
+
+        print(f"Saved: {out_path}")
+        
 def save_outputs(output_dir, tag, rgb):
 
     os.makedirs(f"{output_dir}/renders_ours/", exist_ok=True)

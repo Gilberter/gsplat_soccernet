@@ -49,7 +49,10 @@ from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
 from gsplat.strategy import DefaultStrategy
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+from utils_depth import depth_loss_step, ScaleAndShiftInvariantLoss,ScaleAndShiftInvariantLossLight
+from utils import AppearanceOptModule, AppearanceOptModuleV2, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
+from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss,  get_depth_lambda_schedule 
 
 @dataclass
 class Config:
@@ -191,13 +194,24 @@ class Config:
 
     feature_dim: int =32
 
+    # Opacity regularization
+    opacity_reg: float = 0.0
+    # Scale regularization
+    scale_reg: float = 0.0
+    mini_depth_dir: str = ""
+
+    strategy_depth: Literal["None","progressive","cosine_warmup","exponential"] = "cosine_warmup"
+
+    depth_loss_to_compute: List[Literal["SSIL", "MSS"]] = field(default_factory=lambda: ["SSIL"])
+
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
         self.refine_start_iter = int(self.refine_start_iter * factor)
-        self.refine_stop_iter = int(self.refine_stop_iter * factor)
+        self.refine_stop_iter = int(self.max_steps*0.6)
         self.reset_every = int(self.reset_every * factor)
         self.refine_every = int(self.refine_every * factor)
 
@@ -213,6 +227,8 @@ def create_splats_with_optimizers(
     sh_degree: int = 3,
     sparse_grad: bool = False,
     batch_size: int = 1,
+    app_opt: bool = False,         
+
     feature_dim: Optional[int] = None,
     device: str = "cuda",
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
@@ -241,7 +257,7 @@ def create_splats_with_optimizers(
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
     ]
 
-    if feature_dim is None:
+    if not app_opt:  
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
@@ -306,6 +322,8 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            load_mini_npz=cfg.mini_depth_dir # Load Depth and Confidence Maps from DA3
+
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -323,8 +341,10 @@ class Runner:
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
+            app_opt=cfg.app_opt,           
+
             batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
+            feature_dim=cfg.feature_dim if cfg.app_opt else None,  # Add this
             device=self.device,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
@@ -354,17 +374,31 @@ class Runner:
         self.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = self.strategy.initialize_state()
 
-        self.pose_optimizers = []
-        if cfg.pose_opt:
-            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
-            self.pose_adjust.zero_init()
-            self.pose_optimizers = [
-                torch.optim.Adam(
-                    self.pose_adjust.parameters(),
-                    lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
-                    weight_decay=cfg.pose_opt_reg,
-                )
-            ]
+        self.app_optimizers = []
+        if cfg.app_opt:
+            self.app_module = AppearanceOptModuleV2(  # or AppearanceOptModule
+                len(self.trainset),      # number of images
+                cfg.feature_dim,         # feature dimension (32)
+                cfg.app_embed_dim,       # embedding dimension (16)
+                cfg.sh_degree            # SH degree (3)
+            ).to(self.device)
+
+            # Create separate optimizers for different parts
+            opt_embeds = torch.optim.Adam(
+                self.app_module.embeds.parameters(),
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
+                weight_decay=cfg.app_opt_reg,
+            )
+
+            opt_color_head = torch.optim.Adam(
+                self.app_module.color_head.parameters(),
+                lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size)
+            )
+
+            self.app_optimizers = [opt_embeds, opt_color_head]
+
+            if world_size > 1:
+                self.app_module = DDP(self.app_module)
 
         if cfg.pose_noise > 0.0:
             self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
@@ -425,19 +459,21 @@ class Runner:
         image_ids = kwargs.pop("image_ids", None)
 
         if self.cfg.app_opt:
+            sh0 = torch.sigmoid(self.splats["colors"])  # [N, 3]
+            base_colors = sh0[None].expand(camtoworlds.shape[0], -1, -1)  # [C, N, 3]
+
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+                base_colors=base_colors,  # if using AppearanceOptModuleV2
             )
-            colors = colors + self.splats["colors"]
-            colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
-
+            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)
+            
         assert self.cfg.antialiased is False, "Antialiased is not supported for 2DGS"
-        print(f"Colors {colors.shape} depths")
+        #print(f"Colors {colors.shape} depths")
         if self.model_type == "2dgs":
             (
                 render_colors,
@@ -555,6 +591,7 @@ class Runner:
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+                depth_prior = data["mini_depth"].to(device)  # [1, H, W]
 
             height, width = pixels.shape[1:3]
 
@@ -585,13 +622,13 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB" if cfg.depth_loss else "RGB+D",
+                render_mode="RGB+ED",
                 distloss=self.cfg.dist_loss,
             )
             if renders.shape[-1] == 4:
-                colors, depths = renders[..., 0:3], renders[..., 3:4]
+                colors, depth_rendered = renders[..., 0:3], renders[..., 3:4]
             else:
-                colors, depths = renders, None
+                colors, depth_rendered = renders, None
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
@@ -616,26 +653,71 @@ class Runner:
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                if cfg.strategy_depth == "None":
+                    lambda_base = cfg.depth_lambda
+                else:
+                    lambda_base = get_depth_lambda_schedule(
+                        step=step,
+                        max_steps=cfg.max_steps,
+                        strategy=cfg.strategy_depth,
+                        lambda_base=cfg.depth_lambda,
+                    )
+
+                depthloss_total = 0.0
+
+                if "MSS" in cfg.depth_loss_to_compute:
+                    depthloss, depth_info = depth_loss_step(
+                        depth_rendered=depth_rendered,      # (1, H, W, 1)
+                        da3_depth=depth_prior,              # (1, 1, H, W)
+                        points_px=points,                   # (1, M, 2)
+                        depths_colmap=depths_gt,            # (1, M)
+                        scene_scale=self.scene_scale,
+                        lambda_sparse=lambda_base,          # Already has weight
+                        lambda_dense=lambda_base * 0.1,     # Already has weight
+                        device=device,
+                    )
+
+                    # ✅ FIX 1: Don't multiply by lambda_base again!
+                    # The depth_loss_step already applies lambda_sparse and lambda_dense
+                    if torch.isfinite(depthloss) and depthloss.item() > 0:
+                        # ✅ FIX 2: Clamp to prevent explosion
+                        depthloss_mss = torch.clamp(depthloss, max=10.0)
+                        depthloss_total = depthloss_total + depthloss_mss
+                        if step % 500 == 0:
+                            print(f"[Step {step}] MSS depth loss: {depthloss_mss.item():.6f}")
+                    else:
+                        depthloss_mss = torch.tensor(0.0, device=device)
+
+                if "SSIL" in cfg.depth_loss_to_compute:
+                    ssi_loss_fn = ScaleAndShiftInvariantLossLight()
+                    depth_rendered_perm = depth_rendered.permute(0, 3, 1, 2).squeeze(0)  # [H, W]
+                    mask = torch.ones_like(depth_rendered_perm)
+                    depth_prior_squeezed = depth_prior.squeeze(0)  # [H, W]
+
+                    depthloss_ssil = ssi_loss_fn(
+                        depth_rendered_perm,
+                        depth_prior_squeezed,
+                        mask
+                    )
+
+                    if torch.isfinite(depthloss_ssil) and depthloss_ssil.item() > 0:
+                        # ✅ FIX 4: Clamp to prevent explosion
+                        depthloss_ssil = torch.clamp(depthloss_ssil, max=10.0) * lambda_base
+                        depthloss_total = depthloss_total + depthloss_ssil
+                        if step % 500 == 0:
+                            print(f"[Step {step}] SSIL depth loss: {depthloss_ssil.item():.6f}")
+                    else:
+                        depthloss_ssil = torch.tensor(0.0, device=device)
+
+                if depthloss_total > 0:
+                    loss = loss + depthloss_total
+                    if step % 500 == 0:
+                        print(f"[Step {step}] Total depth loss: {depthloss_total.item():.6f}, "
+                            f"RGB loss: {l1loss.item():.6f}, Combined loss: {loss.item():.6f}")
+
 
             if cfg.normal_loss:
+                #print(f"cfg.normal_loss {cfg.normal_loss}")
                 if step > cfg.normal_start_iter:
                     curr_normal_lambda = cfg.normal_lambda
                 else:
@@ -662,7 +744,7 @@ class Runner:
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
+                desc += f"depth loss={depthloss_total.item():.6f}| "
             if cfg.dist_loss:
                 desc += f"dist loss={distloss.item():.6f}"
             if cfg.pose_opt and cfg.pose_noise:
@@ -679,7 +761,7 @@ class Runner:
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
-                    self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                    self.writer.add_scalar("train/depthloss", depthloss_total.item(), step)
                 if cfg.normal_loss:
                     self.writer.add_scalar("train/normalloss", normalloss.item(), step)
                 if cfg.dist_loss:
@@ -723,12 +805,13 @@ class Runner:
             for optimizer in self.optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.pose_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            # for optimizer in self.pose_optimizers:
+            #     optimizer.step()
+            #     optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -762,8 +845,9 @@ class Runner:
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
-                self.eval(step)
-                self.render_traj(step)
+                #self.eval(step)
+                #self.render_traj(step)
+                continue
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -816,6 +900,12 @@ class Runner:
                 far_plane=cfg.far_plane,
                 render_mode="RGB",
             )  # [1, H, W, 3]
+
+            #print(f"COLORS {colors.dtype} ALPHAS {alphas.dtype} NORMALS {normals.dtype}")
+
+            #print(f"COLORS shape {colors.shape} ALPHAS shape {alphas.shape} NORMALS {normals.dtype}")
+
+
             colors = torch.clamp(colors, 0.0, 1.0)
             colors = colors[..., :3]  # Take RGB channels
             torch.cuda.synchronize()
@@ -847,34 +937,34 @@ class Runner:
             imageio.imwrite(
                 f"{self.render_dir}/val_{i:04d}_normal_{step}.png", normals_output
             )
-
-            # write normals from depth
-            normals_from_depth *= alphas.squeeze(0).detach()
-            normals_from_depth = (normals_from_depth * 0.5 + 0.5).cpu().numpy()
-            normals_from_depth = (normals_from_depth - np.min(normals_from_depth)) / (
-                np.max(normals_from_depth) - np.min(normals_from_depth)
-            )
-            normals_from_depth_output = (normals_from_depth * 255).astype(np.uint8)
-            if len(normals_from_depth_output.shape) == 4:
-                normals_from_depth_output = normals_from_depth_output.squeeze(0)
-            imageio.imwrite(
-                f"{self.render_dir}/val_{i:04d}_normals_from_depth_{step}.png",
-                normals_from_depth_output,
-            )
+            if not normals_from_depth == None:
+                # write normals from depth
+                normals_from_depth *= alphas.squeeze(0).detach()
+                normals_from_depth = (normals_from_depth * 0.5 + 0.5).cpu().numpy()
+                normals_from_depth = (normals_from_depth - np.min(normals_from_depth)) / (
+                    np.max(normals_from_depth) - np.min(normals_from_depth)
+                )
+                normals_from_depth_output = (normals_from_depth * 255).astype(np.uint8)
+                if len(normals_from_depth_output.shape) == 4:
+                    normals_from_depth_output = normals_from_depth_output.squeeze(0)
+                imageio.imwrite(
+                    f"{self.render_dir}/val_{i:04d}_normals_from_depth_{step}.png",
+                    normals_from_depth_output,
+                )
 
             # write distortions
-
-            render_dist = render_distort
-            dist_max = torch.max(render_dist)
-            dist_min = torch.min(render_dist)
-            render_dist = (render_dist - dist_min) / (dist_max - dist_min)
-            render_dist = (
-                apply_float_colormap(render_dist).detach().cpu().squeeze(0).numpy()
-            )
-            imageio.imwrite(
-                f"{self.render_dir}/val_{i:04d}_distortions_{step}.png",
-                (render_dist * 255).astype(np.uint8),
-            )
+            if cfg.dist_loss:
+                render_dist = render_distort
+                dist_max = torch.max(render_dist)
+                dist_min = torch.min(render_dist)
+                render_dist = (render_dist - dist_min) / (dist_max - dist_min)
+                render_dist = (
+                    apply_float_colormap(render_dist).detach().cpu().squeeze(0).numpy()
+                )
+                imageio.imwrite(
+                    f"{self.render_dir}/val_{i:04d}_distortions_{step}.png",
+                    (render_dist * 255).astype(np.uint8),
+                )
 
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -938,7 +1028,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                render_mode="RGB",
+                render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
             depths = renders[0, ..., 3:4]  # [H, W, 1]
@@ -947,7 +1037,7 @@ class Runner:
             surf_normals = (surf_normals - surf_normals.min()) / (
                 surf_normals.max() - surf_normals.min()
             )
-            print(f"Shape colors and depeths {colors.shape} {depths.shape}")
+            #print(f"Shape colors and depeths {colors.shape} {depths.shape}")
             # write images
             canvas = torch.cat(
                 [colors, depths.repeat(1, 1, 3)], dim=0 if width > height else 1

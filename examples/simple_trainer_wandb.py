@@ -134,7 +134,7 @@ class Config:
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
-    sh_degree_interval: int = 1000
+    sh_degree_interval: int = 2000 # default 1000
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -266,9 +266,11 @@ class Config:
     # max refine steps
     max_refine_steps: int = 25000
 
-    noise_lr:float = 5e5
+    noise_lr:float = 5e4 # default 5e5
 
     min_opacity:float = 0.01 # Default 0.005
+
+    max_gaussians:int= 1_000_000
 
 
 
@@ -293,6 +295,9 @@ class Config:
             print(f"STRATEGY REFINE STOP ITERATION {strategy.refine_stop_iter } {int(self.max_steps * 0.8)}")
             strategy.refine_every = int(strategy.refine_every * factor)
             strategy.min_opacity = self.min_opacity
+            
+            strategy.cap_max = int(self.max_gaussians)
+
             if strategy.noise_injection_stop_iter >= 0:
                 strategy.noise_injection_stop_iter = int(
                     strategy.noise_injection_stop_iter * factor
@@ -793,20 +798,24 @@ class Runner:
             ),
         ]
 
-        # # NEW SCHEDULERS
+        # # # NEW SCHEDULERS
         # lr_decay_final = 0.1
         # warmup_steps = max(1000, max_steps // 20)
+
         # warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         #     self.optimizers["means"],
         #     start_factor=0.01,
+        #     end_factor=1.0,
         #     total_iters=warmup_steps,
         # )
         # decay_scheduler = torch.optim.lr_scheduler.ExponentialLR(
         #     self.optimizers["means"],
         #     gamma=lr_decay_final ** (1.0 / (max_steps - warmup_steps))
         # )
-        # mean_scheduler = torch.optim.lr_scheduler.ChainedScheduler(
-        #     [warmup_scheduler, decay_scheduler]
+        # mean_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        #     self.optimizers["means"],
+        #     schedulers=[warmup_scheduler, decay_scheduler],
+        #     milestones=[warmup_steps],  # switch at this step
         # )
         # schedulers = [mean_scheduler]
 
@@ -1062,16 +1071,17 @@ class Runner:
                 )
                 loss += post_processing_reg_loss
 
-            # PROGRESSIVE REGULARIZATION
             step_ratio = step / max_steps
-            opacity_reg_weight = cfg.opacity_reg * (0.5 + 0.5 * step_ratio)  # Ramps 0.5x → 1.0x
+
+            # Scale reg stays as your current ramp — it's fine
+           # opacity_reg_weight = cfg.opacity_reg * (0.5 + 0.5 * step_ratio)  # Ramps 0.5x → 1.0x
+            opacity_reg_weight = cfg.opacity_reg * max(0.0, (step_ratio - 0.1) / 0.9)
+
             scale_reg_weight = cfg.scale_reg * (0.5 + 0.5 * step_ratio)      # Ramps 0.5x → 1.0x
 
-
-
-            # regularizations
             if opacity_reg_weight > 0.0:
                 loss += opacity_reg_weight * torch.sigmoid(self.splats["opacities"]).mean()
+            
             if scale_reg_weight > 0.0:
                 loss += scale_reg_weight * torch.exp(self.splats["scales"]).mean()
 
@@ -1169,6 +1179,9 @@ class Runner:
 
                 print(f"[Debug] Render range: [{colors.min():.4f}, {colors.max():.4f}]")
                 print(f"[Debug] Loss breakdown: L1={l1loss:.4f}, SSIM={ssimloss:.4f}")
+            
+          
+            
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1201,9 +1214,9 @@ class Runner:
                         data["feature_dim"] = cfg.feature_dim
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
-                )
+                ckpt_path = f"{self.ckpt_dir}/ckpt_{step:06d}_rank{self.world_rank}.pt"
+                torch.save(data, ckpt_path)
+                print(f"✓ Checkpoint saved: {ckpt_path}")
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
@@ -1286,7 +1299,7 @@ class Runner:
 
 
             noise_decay = 0.1 ** (step / cfg.max_steps)  # Decays to 10% by end
-            adjusted_noise_lr = self.cfg.noise_lr * noise_decay
+            adjusted_noise_lr = cfg.noise_lr * noise_decay
 
 
             # Run post-backward steps after backward and optimizer
@@ -1309,7 +1322,7 @@ class Runner:
                     state=self.strategy_state,
                     step=step,
                     info=info,
-                    lr=noise_decay,
+                    lr=adjusted_noise_lr,
                 )
             else:
                 assert_never(self.cfg.strategy)
