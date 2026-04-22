@@ -169,7 +169,7 @@ class MCMCStrategy(Strategy):
                 params=params,
                 optimizers=optimizers,
                 state={},
-                scaler=lr * self.noise_lr,
+                scaler=lr,
             )
 
     @torch.no_grad()
