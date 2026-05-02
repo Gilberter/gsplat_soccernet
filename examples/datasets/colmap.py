@@ -425,13 +425,21 @@ class Dataset:
         # Validate the mask directory exists and index available files
         self.ground_mask_files = {}
         if self.load_ground_masks != "":
+            print(f"Loading Ground Mask {self.load_ground_masks}")
             assert os.path.exists(load_ground_masks), \
-                f"Ground mask directory {load_ground_masks} does not exist."
-            for fname in os.listdir(load_ground_masks):
+                f"Ground mask directory {self.load_ground_masks} does not exist."
+            for fname in os.listdir(self.load_ground_masks):
                 # key by stem so "frame_001.png" matches "frame_001.jpg" image names
+                
+
                 stem = os.path.splitext(fname)[0]
-                self.ground_mask_files[stem] = os.path.join(load_ground_masks, fname)
-        print(f"Ground Mask Files {len(self.ground_mask_files)}")
+
+                
+                masked_image = os.path.join(self.load_ground_masks, fname)
+                self.ground_mask_files[stem] =masked_image
+
+            print(f"Ground Mask Files {len(self.ground_mask_files)}")
+            assert len(self.ground_mask_files) != 0
 
         if self.load_mini_npz != "":
             assert os.path.exists(load_mini_npz), \
@@ -454,8 +462,11 @@ class Dataset:
             self.indices = indices
         elif split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
-        else:
+            #self.indices = indices[list(range(self.parser.test_every,len(self.parser.image_names)))]
+        elif split == "val":
             self.indices = indices[indices % self.parser.test_every == 0]
+            #self.indices = indices[list(range(self.parser.test_every))]
+            
 
     def __len__(self):
         return len(self.indices)

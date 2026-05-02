@@ -12,6 +12,146 @@ import numpy as np
 # LEVEL 1 — DA3 DENSE METRIC DEPTH
 # =============================================================================
 
+
+
+def build_pixel_weight_map(
+    mask: Tensor,          # [1, H, W] bool  — True = "strong" region
+    lambda_strong: float,  # weight for masked pixels
+    lambda_weak: float,    # weight for unmasked pixels
+) -> Tensor:
+    """
+    Converts a binary mask into a float weight map.
+
+    mask=True  → lambda_strong  (e.g. ground pixels you trust more)
+    mask=False → lambda_weak    (e.g. sky / background)
+
+    Returns [1, H, W] float.
+    """
+    w = torch.where(mask, 
+                    torch.full_like(mask, lambda_strong, dtype=torch.float32),
+                    torch.full_like(mask, lambda_weak,   dtype=torch.float32))
+    return w   # [1, H, W]
+
+
+def weighted_l1_loss(
+    rendered: Tensor,      # [1, H, W, 3]
+    target:   Tensor,      # [1, H, W, 3]
+    weight_map: Tensor,    # [1, H, W]    from build_pixel_weight_map
+) -> Tensor:
+    """
+    Per-pixel weighted L1 loss.
+    Equivalent to: mean( weight_map * |rendered - target| )
+    """
+    err = (rendered - target).abs()                      # [1, H, W, 3]
+    w   = weight_map.unsqueeze(-1)                       # [1, H, W, 1]  broadcast over RGB
+    return (err * w).mean()
+
+
+def weighted_ssim_loss(
+    rendered: Tensor,      # [1, H, W, 3]
+    target:   Tensor,      # [1, H, W, 3]
+    weight_map: Tensor,    # [1, H, W]
+    ssim_fn,               # your existing fused_ssim callable
+) -> Tensor:
+    """
+    Spatially-weighted SSIM loss.
+
+    fused_ssim returns a scalar, so we can't weight per-pixel directly.
+    Instead we compute SSIM on masked/unmasked crops separately and
+    combine — simple and avoids touching the fused CUDA kernel.
+    """
+    mask_bool = weight_map > weight_map.mean()           # [1, H, W] bool
+    
+    rend_p = rendered.permute(0, 3, 1, 2)               # [1, 3, H, W]
+    targ_p = target.permute(0, 3, 1, 2)
+
+    # Strong region SSIM
+    ssim_strong = ssim_fn(rend_p, targ_p, padding="valid")
+    
+    # Mask out the weak region and recompute
+    rend_masked = rend_p * mask_bool.unsqueeze(1).float()
+    targ_masked = targ_p * mask_bool.unsqueeze(1).float()
+    ssim_weak = ssim_fn(rend_masked, targ_masked, padding="valid")
+
+    strong_ratio = mask_bool.float().mean()
+    return strong_ratio * ssim_strong + (1 - strong_ratio) * ssim_weak
+
+
+def masked_depth_loss(
+    depth_rendered: Tensor,   # [1, H, W, 1]
+    depth_prior:    Tensor,   # [1, H, W]  or [1, 1, H, W]
+    weight_map:     Tensor,   # [1, H, W]
+    loss_fn,                  # e.g. ScaleAndShiftInvariantLossLight()
+) -> Tensor:
+    """
+    Apply a stronger depth regularizer inside the masked region.
+
+    Computes SSI loss twice — once on the full image, once only on
+    the masked region — then blends by mask coverage.
+
+    This lets ground pixels dominate the depth signal without
+    completely ignoring the rest of the scene.
+    """
+    d_rend = depth_rendered.permute(0, 3, 1, 2).squeeze(0)   # [H, W]
+    d_prior = depth_prior.squeeze(0) if depth_prior.dim() == 4 \
+              else depth_prior.squeeze(0)                      # [H, W]
+
+    mask_float = (weight_map.squeeze(0) > weight_map.mean()).float()  # [H, W]
+    ones = torch.ones_like(mask_float)
+
+    # Full-image depth loss
+    loss_full = loss_fn(d_rend, d_prior, ones)
+
+    # Masked-region depth loss (only compute where mask=1)
+    loss_masked = loss_fn(d_rend * mask_float, 
+                          d_prior * mask_float, 
+                          mask_float)
+
+    # Strong region gets extra weight — blend by how much of the image is masked
+    mask_coverage = mask_float.mean().clamp(0.05, 0.95)
+    return (1.0 - mask_coverage) * loss_full + mask_coverage * loss_masked
+
+
+def masked_opacity_regularizer(
+    opacities:    Tensor,     # [N]      sigmoid opacities  
+    means2d:      Tensor,     # [C, N, 2] projected Gaussian centres (pixels)
+    weight_map:   Tensor,     # [1, H, W] from build_pixel_weight_map
+    height: int,
+    width:  int,
+) -> Tensor:
+    """
+    Per-Gaussian opacity regularizer weighted by the pixel-space mask.
+
+    For each Gaussian, sample weight_map at its projected 2D centre,
+    then compute:
+
+        loss = mean( w_i * opacity_i )
+
+    Gaussians projecting into mask=True pixels get lambda_strong,
+    others get lambda_weak — so ground Gaussians are penalised harder.
+    """
+
+    pts = means2d[0]                                       # [N, 2]  (x, y) pixels
+
+    # Normalise to [-1, 1] for grid_sample
+    norm_x = (pts[:, 0] / (width  - 1)) * 2.0 - 1.0
+    norm_y = (pts[:, 1] / (height - 1)) * 2.0 - 1.0
+    grid   = torch.stack([norm_x, norm_y], dim=-1)        # [N, 2]
+
+    # weight_map: [1, H, W] → [1, 1, H, W]
+    # grid:       [N, 2]    → [1, 1, N, 2]
+    wm_4d   = weight_map.unsqueeze(0)                     # [1, 1, H, W]
+    grid_4d = grid[None, None]                            # [1, 1, N, 2]
+
+    per_gauss_w = F.grid_sample(
+        wm_4d, grid_4d,
+        mode='nearest',          # binary mask → nearest, not bilinear
+        padding_mode='border',
+        align_corners=True,
+    ).squeeze()                                            # [N]
+
+    return (per_gauss_w * opacities).mean()
+
 def depth_from_da3_loss(
     depths_image: Tensor,     # [C, H, W, 1]  rendered expected depth (RGB+ED)
     da3_depth:    Tensor,     # [C, H, W]     DA3 metric depth (already scale-aligned)

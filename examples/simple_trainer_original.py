@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright 2023-2026 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,10 +56,6 @@ from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from ground_plane_guided import depth_from_da3_loss, build_ground_depth_map, ground_plane_prior_loss, floor_normal_consistency_loss, ground_supervision_loss, get_depth_lambda_schedule
-
-
-from utils_depth import depth_loss_step, ScaleAndShiftInvariantLoss,ScaleAndShiftInvariantLossLight
 
 
 @dataclass
@@ -70,16 +66,13 @@ class Config:
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
-    # Render trajectory path
+    # Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
+    # Dataset backend: "colmap" or "ncore"
+    data_type: str = "colmap"
+    # Path to the Mip-NeRF 360 dataset (colmap) or NCore v4 meta-JSON file (ncore)
     data_dir: str = "data/360_v2/garden"
-
-    # Colmap dir
-    colmap_dir: str = ""
-
-
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
@@ -96,6 +89,25 @@ class Config:
     camera_model: CameraModel = "pinhole"
     # Load EXIF exposure metadata from images (if available)
     load_exposure: bool = True
+
+    # --- NCore-specific options (only used when data_type="ncore") ---
+    # Camera sensor IDs to load (auto-detected from sequence if empty)
+    ncore_camera_ids: List[str] = field(default_factory=list)
+    # Point cloud source IDs to load -- accepts lidar, radar, or native point cloud
+    # source IDs (auto-detected from sequence if empty). Field name kept for backward compat.
+    ncore_lidar_ids: List[str] = field(default_factory=list)
+    # Temporal seek offset in seconds
+    ncore_seek_offset_sec: Optional[float] = None
+    # Clip duration in seconds (None = full sequence)
+    ncore_duration_sec: Optional[float] = None
+    # Maximum number of lidar init points
+    ncore_max_lidar_points: int = 500_000
+    # Generic-data key for lidar point RGB colors (fallback to gray if unavailable)
+    ncore_lidar_color_generic_data_name: str = "rgb"
+    # NCore component group names
+    ncore_poses_component_group: str = "default"
+    ncore_intrinsics_component_group: str = "default"
+    ncore_masks_component_group: str = "default"
 
     # Port for the viewer server
     port: int = 8080
@@ -212,7 +224,7 @@ class Config:
     # Enable depth loss. (experimental)
     depth_loss: bool = False
     # Weight for depth loss
-    depth_lambda: float = 1e-3
+    depth_lambda: float = 1e-2
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -224,28 +236,6 @@ class Config:
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
     with_eval3d: bool = False
-
-    # Ground plane depth supervision
-
-    ground_depth_loss: bool = False
-    ground_depth_lambda: float = 2.3
-    ground_seg_dir: str = ""
-    ground_depth_start_step: int = 1000
-
-    ## Strategy depth lambda schedule
-    strategy_depth: Literal["None","progressive","cosine_warmup","exponential"] = "progressive"
-    depth_loss_to_compute: List[Literal["SSIL", "MSS"]] = field(default_factory=lambda: ["SSIL"])   
-    # SFIL Scale and Shift Invariant Loss 
-    # MSS Multi Source Supervision
-
-    rasterize_mode: Optional[Literal["classic", "antialiased"]] = None
-
-    absgrad: bool = False
-
-    mini_depth_dir: str = ""
-
-    feature_dim: int = 32
-
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -295,14 +285,14 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
+    if init_type == "sfm" or init_type == "lidar":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        raise ValueError("Please specify a correct init_type: sfm, random, or lidar")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -326,7 +316,7 @@ def create_splats_with_optimizers(
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
 
-    if cfg.app_opt == False:
+    if feature_dim is None:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
@@ -396,24 +386,52 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
-            test_every=cfg.test_every,
-            load_exposure=cfg.load_exposure,
-            colmap_dir=cfg.colmap_dir
-        )
+        if cfg.data_type == "ncore":
+            from datasets.ncore import NCoreDataset, NCoreParser
 
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss, # Load Ground Truth Depths from COLMAP
-            load_ground_masks=cfg.ground_seg_dir, # SAM Ground Segmentation Directory
-            load_mini_npz=cfg.mini_depth_dir # Load Depth and Confidence Maps from DA3
-        )
-        self.valset = Dataset(self.parser, split="val")
+            self.parser = NCoreParser(
+                meta_json_path=cfg.data_dir,
+                factor=1.0 / cfg.data_factor if cfg.data_factor > 1 else 1.0,
+                test_every=cfg.test_every,
+                camera_ids=cfg.ncore_camera_ids or None,
+                lidar_ids=cfg.ncore_lidar_ids or None,
+                seek_offset_sec=cfg.ncore_seek_offset_sec,
+                duration_sec=cfg.ncore_duration_sec,
+                max_lidar_points=cfg.ncore_max_lidar_points,
+                lidar_color_generic_data_name=cfg.ncore_lidar_color_generic_data_name,
+                poses_component_group=cfg.ncore_poses_component_group,
+                intrinsics_component_group=cfg.ncore_intrinsics_component_group,
+                masks_component_group=cfg.ncore_masks_component_group,
+                normalize_world_space=cfg.normalize_world_space,
+            )
+            self.trainset = NCoreDataset(self.parser, split="train")
+            self.valset = NCoreDataset(self.parser, split="val")
+            self.ncore_camera_data = [
+                self.parser.camera_render_data[cam_id]
+                for cam_id in self.parser.camera_ids
+            ]
+            if (
+                any(d.camera_model == "ftheta" for d in self.ncore_camera_data)
+                and not cfg.with_eval3d
+            ):
+                print(
+                    "[NCore] Warning: FTheta cameras detected; pass --with-eval3d True for correct results."
+                )
+        else:
+            self.parser = Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+                load_exposure=cfg.load_exposure,
+            )
+            self.trainset = Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -437,6 +455,7 @@ class Runner:
             )
 
         # Model
+        feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -455,7 +474,7 @@ class Runner:
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
-            feature_dim=cfg.feature_dim,
+            feature_dim=feature_dim,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
@@ -504,9 +523,9 @@ class Runner:
 
         self.app_optimizers = []
         if cfg.app_opt:
-   
+            assert feature_dim is not None
             self.app_module = AppearanceOptModule(
-                len(self.trainset), cfg.feature_dim, cfg.app_embed_dim, cfg.sh_degree
+                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
             # initialize the last layer to be zero so that the initial output is zero.
             torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
@@ -626,9 +645,7 @@ class Runner:
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
-        print(image_ids)
         if self.cfg.app_opt:
-            print(f"SHAPE SPLATS FEATURES {self.splats['features'].shape}")
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
@@ -644,6 +661,33 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
+        ftheta_coeffs = None
+        radial_coeffs = None
+        tangential_coeffs = None
+        thin_prism_coeffs = None
+        with_ut = self.cfg.with_ut
+
+        if camera_idcs is not None and hasattr(self, "ncore_camera_data"):
+            cam = self.ncore_camera_data[camera_idcs.item()]
+            camera_model = cam.camera_model
+            ftheta_coeffs = cam.ftheta_coeffs
+            if cam.radial_coeffs is not None:
+                radial_coeffs = (
+                    torch.from_numpy(cam.radial_coeffs).to(means.device).unsqueeze(0)
+                )
+            if cam.tangential_coeffs is not None:
+                tangential_coeffs = (
+                    torch.from_numpy(cam.tangential_coeffs)
+                    .to(means.device)
+                    .unsqueeze(0)
+                )
+            if cam.thin_prism_coeffs is not None:
+                thin_prism_coeffs = (
+                    torch.from_numpy(cam.thin_prism_coeffs)
+                    .to(means.device)
+                    .unsqueeze(0)
+                )
+
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -661,15 +705,17 @@ class Runner:
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
-            rasterize_mode=cfg.rasterize_mode,
+            rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
-            camera_model=self.cfg.camera_model,
-            with_ut=self.cfg.with_ut,
+            camera_model=camera_model,
+            with_ut=with_ut,
             with_eval3d=self.cfg.with_eval3d,
+            ftheta_coeffs=ftheta_coeffs,
+            radial_coeffs=radial_coeffs,
+            tangential_coeffs=tangential_coeffs,
+            thin_prism_coeffs=thin_prism_coeffs,
             **kwargs,
         )
-        if "means2d" in info and not info["means2d"].requires_grad:
-            info["means2d"] = info["means2d"] + 0.0 * means[..., None, :, :2].expand_as(info["means2d"])
         if masks is not None:
             render_colors[~masks] = 0
 
@@ -813,17 +859,9 @@ class Runner:
             exposure = (
                 data["exposure"].to(device) if "exposure" in data else None
             )  # [B,]
-
-            RENDER_MODE = "RGB"
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
-                depth_prior = data["mini_depth"].to(device)  # [1, H, W]
-                # cofidence_depth_map = data["mini_confidence"].to(device)  # [1, H, W]
-                RENDER_MODE = "RGB+ED"
-            if cfg.ground_depth_loss: # Added ground masks
-                ground_masks = data["ground_mask"].to(device)  # [1, H, W] bool
-                
 
             height, width = pixels.shape[1:3]
 
@@ -846,16 +884,16 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode=RENDER_MODE,
+                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
                 frame_idcs=image_ids,
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )
             if renders.shape[-1] == 4:
-                colors, depth_rendered = renders[..., 0:3], renders[..., 3:4]
+                colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
-                colors, depth_rendered = renders, None
+                colors, depths = renders, None
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
@@ -870,156 +908,42 @@ class Runner:
             )
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
+            if masks is not None:
+                # Exclude masked pixels (e.g. ego vehicle) from L1.
+                # For SSIM (patch-based), zero out both sides at masked locations
+                # so masked patches don't pull colors toward an arbitrary value.
+                l1loss = F.l1_loss(colors[masks], pixels[masks])
+                colors_ssim = colors * masks[..., None]
+                pixels_ssim = pixels * masks[..., None]
+            else:
+                l1loss = F.l1_loss(colors, pixels)
+                colors_ssim = colors
+                pixels_ssim = pixels
             ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                colors_ssim.permute(0, 3, 1, 2),
+                pixels_ssim.permute(0, 3, 1, 2),
+                padding="valid",
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
-
-            # if cfg.depth_loss:
-
-            #     if cfg.strategy_depth == "None":
-            #         lambda_base = cfg.depth_lambda
-            #     else:
-            #         lambda_base = get_depth_lambda_schedule(step=step,max_steps=cfg.max_steps,strategy=cfg.strategy_depth,lambda_base=cfg.depth_lambda)
-
-            #     if "MSS" in cfg.depth_loss_to_compute:
-            #         if step == cfg.max_steps * 0.25:
-            #             print(lambda_base)
-            #         if step == cfg.max_steps * 0.70:
-            #             print(lambda_base)
-            #         depthloss, depth_info = depth_loss_step(
-            #             depth_rendered = depth_rendered,          # (1, H, W, 1)  from rasterizer
-            #             da3_depth      = depth_prior,             # (1, 1, H, W)  raw DA3, NOT permuted
-            #             points_px      = points,                  # (1, M, 2)     COLMAP pixels
-            #             depths_colmap  = depths_gt,               # (1, M)        COLMAP metric depths
-            #             scene_scale    = self.scene_scale,
-            #             lambda_sparse  = lambda_base,        # e.g. 1e-2  (high trust)
-            #             lambda_dense   = lambda_base * 0.1,  # e.g. 1e-3  (lower trust)
-            #             device         = device,
-            #         )
-                
-            #         if torch.isfinite(depthloss) and depthloss.item() > 0:
-            #             loss = loss + (depthloss * lambda_base)
-            #         else:
-            #             depthloss = torch.tensor(0.0, device=device)
-
-            #     if "SSIL" in cfg.depth_loss_to_compute:
-
-            #         ssi_loss_fn = ScaleAndShiftInvariantLossLight()
-            #         depth_rendered = depth_rendered.permute(0, 3, 1, 2).squeeze(0)
-            #         mask = torch.ones_like(depth_rendered)
-            #         depth_prior = depth_prior.squeeze(0)
-            #         print(f"Shape mask {mask.shape} depth_prior {depth_prior.shape} depth_rendered {depth_rendered.shape}")
-            #         depthloss = ssi_loss_fn(depth_rendered,depth_prior,mask)
-
-            #         if torch.isfinite(depthloss) and depthloss.item() > 0:
-            #             loss = loss + depthloss
-            #         else:
-            #             depthloss = torch.tensor(0.0, device=device)
-
             if cfg.depth_loss:
-                # ✅ Get scheduled lambda value
-                if cfg.strategy_depth == "None":
-                    lambda_base = cfg.depth_lambda
-                else:
-                    lambda_base = get_depth_lambda_schedule(
-                        step=step,
-                        max_steps=cfg.max_steps,
-                        strategy=cfg.strategy_depth,
-                        lambda_base=cfg.depth_lambda,
-                    )
-
-                depthloss_total = 0.0
-
-                if "MSS" in cfg.depth_loss_to_compute:
-                    depthloss, depth_info = depth_loss_step(
-                        depth_rendered=depth_rendered,      # (1, H, W, 1)
-                        da3_depth=depth_prior,              # (1, 1, H, W)
-                        points_px=points,                   # (1, M, 2)
-                        depths_colmap=depths_gt,            # (1, M)
-                        scene_scale=self.scene_scale,
-                        lambda_sparse=lambda_base,          # Already has weight
-                        lambda_dense=lambda_base * 0.1,     # Already has weight
-                        device=device,
-                    )
-                    
-                    # ✅ FIX 1: Don't multiply by lambda_base again!
-                    # The depth_loss_step already applies lambda_sparse and lambda_dense
-                    if torch.isfinite(depthloss) and depthloss.item() > 0:
-                        # ✅ FIX 2: Clamp to prevent explosion
-                        depthloss_mss = torch.clamp(depthloss, max=10.0)
-                        depthloss_total = depthloss_total + depthloss_mss
-                        if step % 500 == 0:
-                            print(f"[Step {step}] MSS depth loss: {depthloss_mss.item():.6f}")
-                    else:
-                        depthloss_mss = torch.tensor(0.0, device=device)
-
-                if "SSIL" in cfg.depth_loss_to_compute:
-                    ssi_loss_fn = ScaleAndShiftInvariantLossLight()
-                    depth_rendered_perm = depth_rendered.permute(0, 3, 1, 2).squeeze(0)  # [H, W]
-                    mask = torch.ones_like(depth_rendered_perm)
-                    depth_prior_squeezed = depth_prior.squeeze(0)  # [H, W]
-                    
-                    depthloss_ssil = ssi_loss_fn(
-                        depth_rendered_perm,
-                        depth_prior_squeezed,
-                        mask
-                    )
-                    
-                    # ✅ FIX 3: Apply lambda_base weighting to SSIL too!
-                    if torch.isfinite(depthloss_ssil) and depthloss_ssil.item() > 0:
-                        # ✅ FIX 4: Clamp to prevent explosion
-                        depthloss_ssil = torch.clamp(depthloss_ssil, max=10.0) * lambda_base
-                        depthloss_total = depthloss_total + depthloss_ssil
-                        if step % 500 == 0:
-                            print(f"[Step {step}] SSIL depth loss: {depthloss_ssil.item():.6f}")
-                    else:
-                        depthloss_ssil = torch.tensor(0.0, device=device)
-
-                # ✅ FIX 5: Add total depth loss with proper scaling
-                if depthloss_total > 0:
-                    loss = loss + depthloss_total
-                    if step % 500 == 0:
-                        print(f"[Step {step}] Total depth loss: {depthloss_total.item():.6f}, "
-                            f"RGB loss: {l1loss.item():.6f}, Combined loss: {loss.item():.6f}")
-                        
-
-            if cfg.ground_depth_loss and ground_masks is not None and step >= cfg.ground_depth_start_step:
-                
-                viewmats_c = torch.linalg.inv(camtoworlds)    # [1, 4, 4]
-
-                D_gt = build_ground_depth_map(
-                    viewmats   = viewmats_c[0],               # [1, 4, 4] → [C, 4, 4]  C=1
-                    Ks         = Ks[0].unsqueeze(0),          # [1, 3, 3]
-                    masks      = ground_masks,                # [1, H, W]
-                    width      = width,
-                    height     = height,
-                    near_plane = cfg.near_plane,
-                    far_plane  = cfg.far_plane,
-                )                                             # [1, H, W]
-
-                da3 = data["mini_depth"].to(device).unsqueeze(0) if "mini_depth" in data else None
-
-                gnd_loss, gnd_info = ground_supervision_loss(
-                    depths_image       = depths_image,        # [1, H, W, 1]
-                    render_normals     = None,                # set from 2DGS outputs if using 2DGS
-                    normals_from_depth = None,
-                    alpha_map          = alphas,
-                    da3_depth          = da3,
-                    D_gt               = D_gt,
-                    ground_mask        = ground_masks,        # [1, H, W]
-                    scene_scale        = self.scene_scale,
-                    lambda_da3         = 1.0,
-                    lambda_ground      = cfg.ground_depth_lambda,  # 2.3
-                    lambda_normal      = 0.05,                # only active when use_2dgs=True
-                    use_2dgs           = False,               # flip to True with simple_trainer_2dgs
-                )
-
-                if torch.isfinite(gnd_loss):
-                    loss = loss + gnd_loss
-
-
+                # query depths from depth map
+                points = torch.stack(
+                    [
+                        points[:, :, 0] / (width - 1) * 2 - 1,
+                        points[:, :, 1] / (height - 1) * 2 - 1,
+                    ],
+                    dim=-1,
+                )  # normalize to [-1, 1]
+                grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                depths = F.grid_sample(
+                    depths.permute(0, 3, 1, 2), grid, align_corners=True
+                )  # [1, 1, M, 1]
+                depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                # calculate loss in disparity space
+                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                disp_gt = 1.0 / depths_gt  # [1, M]
+                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                loss += depthloss * cfg.depth_lambda
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids
@@ -1041,13 +965,7 @@ class Runner:
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
-                desc += (
-                    f"dep={depthloss_total.item():.4f}| "
-                    # f"spr={depth_info.get('loss_sparse', 0):.4f}| "
-                    # f"dns={depth_info.get('loss_dense',  0):.4f}| "
-                    # f"s={depth_info.get('da3_scale_s', 1):.2f}| "
-                    # f"N={depth_info.get('n_sparse', 0)}"
-                )
+                desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -1071,14 +989,7 @@ class Runner:
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
-                    self.writer.add_scalar("train/depthloss",        depthloss_total.item(),                        step)
-                    # self.writer.add_scalar("train/depth_sparse",     depth_info.get("loss_sparse", 0),        step)
-                    # self.writer.add_scalar("train/depth_dense",      depth_info.get("loss_dense",  0),        step)
-                    # self.writer.add_scalar("train/da3_scale_s",      depth_info.get("da3_scale_s", 1.0),      step)
-                    # self.writer.add_scalar("train/da3_shift_t",      depth_info.get("da3_shift_t", 0.0),      step)
-                    # self.writer.add_scalar("train/depth_n_sparse",   depth_info.get("n_sparse",    0),        step)
-                    # self.writer.add_scalar("train/depth_n_dense",    depth_info.get("n_dense",     0),        step)
-
+                    self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.post_processing is not None:
                     self.writer.add_scalar(
                         "train/post_processing_reg_loss",
@@ -1090,12 +1001,7 @@ class Runner:
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
-            if step % 500 == 0 and world_rank == 0:
-                if not cfg.app_opt:
-                    print(f"[Debug] SH0 range: [{self.splats['sh0'].min():.4f}, {self.splats['sh0'].max():.4f}]")
-                
-                print(f"[Debug] Render range: [{colors.min():.4f}, {colors.max():.4f}]")
-                print(f"[Debug] Loss breakdown: L1={l1loss:.4f}, SSIM={ssimloss:.4f}")
+
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1103,7 +1009,6 @@ class Runner:
                     "mem": mem,
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means"]),
-                    
                 }
                 print("Step: ", step, stats)
                 with open(
@@ -1111,9 +1016,7 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {"step": step, 
-                        "splats": self.splats.state_dict(),
-                        "n_train_images": len(self.trainset),}
+                data = {"step": step, "splats": self.splats.state_dict()}
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -1124,8 +1027,6 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
-                        data["app_embed_dim"] = cfg.app_embed_dim
-                        data["feature_dim"] = cfg.feature_dim
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
                 torch.save(
@@ -1155,7 +1056,6 @@ class Runner:
                 scales = self.splats["scales"]
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
-
                 export_splats(
                     means=means,
                     scales=scales,
@@ -1235,9 +1135,8 @@ class Runner:
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
-                #self.eval(step)
-                #self.render_traj(step)
-                pass
+                self.eval(step)
+                self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1367,7 +1266,10 @@ class Runner:
         device = self.device
 
         camtoworlds_all = self.parser.camtoworlds[5:-5]
-        if cfg.render_traj_path == "interp":
+        if cfg.render_traj_path == "raw":
+            # Use captured poses as-is
+            camtoworlds_all = camtoworlds_all[:, :3, :]  # [N, 3, 4]
+        elif cfg.render_traj_path == "interp":
             camtoworlds_all = generate_interpolated_path(
                 camtoworlds_all, 1
             )  # [N, 3, 4]
@@ -1657,7 +1559,10 @@ if __name__ == "__main__":
                 "and plas (via 'pip install git+https://github.com/fraunhoferhhi/PLAS.git') "
             )
 
-    if cfg.with_ut:
-        assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
+    if cfg.with_ut and cfg.with_eval3d:
+        print(
+            "[Trainer] Note: with_ut=True + with_eval3d=True (full 3DGUT mode). "
+            "DefaultStrategy is incompatible with eval3d; use MCMCStrategy (the `mcmc` subcommand)."
+        )
 
     cli(main, cfg, verbose=True)

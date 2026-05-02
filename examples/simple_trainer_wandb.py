@@ -92,7 +92,7 @@ class Config:
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = 0
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -449,6 +449,8 @@ class Runner:
             load_mini_npz=cfg.mini_depth_dir # Load Depth and Confidence Maps from DA3
         )
         self.valset = Dataset(self.parser, split="val")
+        if len(self.valset) == 0:
+           print(f"No Test Set")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -794,7 +796,7 @@ class Runner:
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                self.optimizers["means"], gamma=0.01 ** (1.0 / 30000)
             ),
         ]
 
@@ -959,7 +961,8 @@ class Runner:
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
-
+            
+            ratio_depth = step / 10_000
             if cfg.depth_loss:
 
                 if cfg.strategy_depth == "None":
@@ -969,7 +972,7 @@ class Runner:
                         step=step,
                         max_steps=cfg.max_steps,
                         strategy=cfg.strategy_depth,
-                        lambda_base=cfg.depth_lambda,
+                        lambda_base=cfg.depth_lambda * ratio_depth,
                     )
 
                 depthloss_total = 0.0
@@ -986,10 +989,8 @@ class Runner:
                         device=device,
                     )
 
-                    # ✅ FIX 1: Don't multiply by lambda_base again!
-                    # The depth_loss_step already applies lambda_sparse and lambda_dense
+                    
                     if torch.isfinite(depthloss) and depthloss.item() > 0:
-                        # ✅ FIX 2: Clamp to prevent explosion
                         depthloss_mss = torch.clamp(depthloss, max=10.0)
                         depthloss_total = depthloss_total + depthloss_mss
                         if step % 500 == 0:
@@ -1010,7 +1011,7 @@ class Runner:
                     )
 
                     if torch.isfinite(depthloss_ssil) and depthloss_ssil.item() > 0:
-                        # ✅ FIX 4: Clamp to prevent explosion
+                        
                         depthloss_ssil = torch.clamp(depthloss_ssil, max=10.0) * lambda_base
                         depthloss_total = depthloss_total + depthloss_ssil
                         if step % 500 == 0:
@@ -1073,10 +1074,24 @@ class Runner:
 
             step_ratio = step / max_steps
 
-            # Scale reg stays as your current ramp — it's fine
+            # Scale reg stays as your current ramp  it's fine
            # opacity_reg_weight = cfg.opacity_reg * (0.5 + 0.5 * step_ratio)  # Ramps 0.5x → 1.0x
-            opacity_reg_weight = cfg.opacity_reg * max(0.0, (step_ratio - 0.1) / 0.9)
+            #opacity_reg_weight = cfg.opacity_reg * max(0.0, (step_ratio - 0.1) / 0.9)
+            
+            # 0% to 15% opacity_reg 0
+            # 15% to 60% opacity increasing
+            # 40% to 100% constant
 
+            if step < 30000:
+                step_ratio = step / 30000
+            else:
+                step_ratio = step / max_steps
+            
+            opacity_reg_weight = cfg.opacity_reg * min(1.0, max(0.0, (step_ratio - 0.1) / 0.5))
+
+            if step >= 30000:
+                opacity_reg_weight = min(opacity_reg_weight, 0.01)
+            
             scale_reg_weight = cfg.scale_reg * (0.5 + 0.5 * step_ratio)      # Ramps 0.5x → 1.0x
 
             if opacity_reg_weight > 0.0:
@@ -1091,10 +1106,7 @@ class Runner:
             if cfg.depth_loss:
                 desc += (
                     f"dep={depthloss_total.item():.4f}| "
-                    # f"spr={depth_info.get('loss_sparse', 0):.4f}| "
-                    # f"dns={depth_info.get('loss_dense',  0):.4f}| "
-                    # f"s={depth_info.get('da3_scale_s', 1):.2f}| "
-                    # f"N={depth_info.get('n_sparse', 0)}"
+        
                 )
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
@@ -1102,14 +1114,6 @@ class Runner:
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
 
-            # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1152,16 +1156,10 @@ class Runner:
                     }, step=step)
 
                 if cfg.depth_loss:
-                    self.writer.add_scalar("train/depthloss",        depthloss_total.item(),                        step)
+                    self.writer.add_scalar("train/depthloss",depthloss_total.item(),step)
                     wandb.log({"train/depth_lambda": lambda_base}, step=step)
 
-                    # self.writer.add_scalar("train/depth_sparse",     depth_info.get("loss_sparse", 0),        step)
-                    # self.writer.add_scalar("train/depth_dense",      depth_info.get("loss_dense",  0),        step)
-                    # self.writer.add_scalar("train/da3_scale_s",      depth_info.get("da3_scale_s", 1.0),      step)
-                    # self.writer.add_scalar("train/da3_shift_t",      depth_info.get("da3_shift_t", 0.0),      step)
-                    # self.writer.add_scalar("train/depth_n_sparse",   depth_info.get("n_sparse",    0),        step)
-                    # self.writer.add_scalar("train/depth_n_dense",    depth_info.get("n_dense",     0),        step)
-
+  
                 if cfg.post_processing is not None:
                     self.writer.add_scalar(
                         "train/post_processing_reg_loss",
@@ -1334,7 +1332,8 @@ class Runner:
                 pass
 
             if step % cfg.wandb_steps == 0:
-                self.eval(step)
+                self.eval_challenge(step)
+                #self.eval(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1358,6 +1357,119 @@ class Runner:
             wandb.finish()
             print(f"✅ Wandb run finished")
 
+    
+    @torch.no_grad()
+    def eval_challenge(self, step: int, stage: str = "challenge"):
+        """
+        Evaluate and log ONLY 3 challenge novel views to W&B.
+        No metrics computed (no ground truth available).
+        Focus: render and visualize challenge camera poses.
+        """
+        print("🎯 Running challenge-only evaluation (3 views)...")
+        cfg = self.cfg
+        device = self.device
+        world_rank = self.world_rank
+
+        if world_rank != 0:
+            return  # Only master process logs to W&B
+
+        try:
+            # Load challenge cameras
+            c2w_mats, ks_list, imsize_list, image_ids = load_challenges(
+                cfg.wandb_path_challenge, factor=cfg.data_factor
+            )
+            num_views = len(c2w_mats)
+            print(f"   Loaded {num_views} challenge views")
+
+            # Select 3 evenly spaced views
+            if num_views >= 3:
+                indices = [0, num_views // 2, num_views - 1]
+            elif num_views == 2:
+                indices = [0, 1]
+            else:
+                indices = [0]
+
+            print(f"   Rendering views at indices: {indices}")
+
+            wandb_log_dict = {}
+            timings = []
+
+            # Render selected challenge views
+            for idx in indices:
+                c2w = torch.from_numpy(c2w_mats[idx]).float().to(device)
+                K = torch.from_numpy(ks_list[idx]).float().to(device)
+                width, height = imsize_list[idx]
+                image_id = image_ids[idx]
+
+                torch.cuda.synchronize()
+                tic = time.time()
+
+                # Render challenge view (RGB + Expected Depth)
+                render_out, _, _ = self.rasterize_splats(
+                    camtoworlds=c2w.unsqueeze(0),
+                    Ks=K.unsqueeze(0),
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+ED",
+                )  # [1, H, W, 4]
+
+                torch.cuda.synchronize()
+                render_time = time.time() - tic
+                timings.append(render_time)
+
+                # Extract RGB and Depth
+                rgb = render_out[0, ..., :3]  # [H, W, 3]
+                depth = render_out[0, ..., 3]  # [H, W]
+                rgb = torch.clamp(rgb, 0.0, 1.0)
+
+                # Convert to uint8 for display
+                rgb_uint8 = (rgb.cpu().numpy() * 255).astype(np.uint8)
+
+                # Visualize depth
+                d_min, d_max = depth.min(), depth.max()
+                if d_max > d_min:
+                    depth_viz = (depth - d_min) / (d_max - d_min + 1e-5)
+                else:
+                    depth_viz = torch.zeros_like(depth)
+                depth_viz_uint8 = (depth_viz.cpu().numpy() * 255).astype(np.uint8)
+
+                # Log to W&B
+                challenge_rgb_img = wandb.Image(
+                    rgb_uint8, caption=f"{stage}_view{idx}_rgb (id:{image_id})"
+                )
+                challenge_depth_img = wandb.Image(
+                    depth_viz_uint8, caption=f"{stage}_view{idx}_depth"
+                )
+
+                wandb_log_dict[f"{stage}_rgb_view{idx}"] = challenge_rgb_img
+                wandb_log_dict[f"{stage}_depth_view{idx}"] = challenge_depth_img
+
+                print(
+                    f"   ✓ View {idx} (image_id={image_id}): "
+                    f"RGB{rgb_uint8.shape} | time={render_time:.3f}s"
+                )
+
+            # Log summary stats
+            avg_time = np.mean(timings)
+            wandb_log_dict[f"{stage}/avg_render_time_per_view"] = avg_time
+            wandb_log_dict[f"{stage}/num_GS"] = len(self.splats["means"])
+            wandb_log_dict[f"{stage}/num_views_rendered"] = len(indices)
+
+            # Send to W&B
+            wandb.log(wandb_log_dict, step=step)
+
+            print(f"✅ Challenge evaluation complete:")
+            print(f"   Views rendered: {len(indices)}")
+            print(f"   Avg time/view: {avg_time:.3f}s")
+            print(f"   Gaussians: {len(self.splats['means']):,}")
+
+        except Exception as e:
+            print(f"❌ Challenge evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
 
 
     @torch.no_grad()
@@ -1468,7 +1580,6 @@ class Runner:
                 
                 formatted_stats = {k: float(v) if torch.is_tensor(v) else v for k, v in stats.items()}
 
-                # ✅ Optionally log an example rendered image
                 if len(metrics["psnr"]) > 0:
                     c2w_mats, ks_list, imsize_list, image_ids = load_challenges(cfg.wandb_path_challenge,factor=cfg.data_factor)
                     c2w = torch.from_numpy(np.array(c2w_mats)).float().to(device)

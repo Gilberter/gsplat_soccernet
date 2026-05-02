@@ -105,11 +105,12 @@ DEPTH_MODEL="DA3MONO-LARGE"
 STRATEGY_DEPTH="progressive"
 SSIM_LAMBDA=0.2
 MAX_GAUSSIANS=1000000
+TEST_EVERY=0
 
 NOISE_LR=500000
 ## wandb
 
-USE_WANDB=true # use wandb
+USE_WANDB=false # use wandb
 WANDB_STEPS_EVAL=1000
 WANDB_RUN_NAME=""
 
@@ -189,6 +190,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --scale-reg)
             SCALE_REG=$2
+            shift 2
+            ;;
+            
+        --test)
+            TEST_EVERY=$2
             shift 2
             ;;
         --data-dir)
@@ -417,6 +423,7 @@ FLAGS="$FLAGS --ssim_lambda $SSIM_LAMBDA"
 FLAGS="$FLAGS --max_refine_steps $MAX_REFINE_STEPS"
 FLAGS="$FLAGS --wandb_path_challenge $WANDB_PATH_CHALLENGE"
 FLAGS="$FLAGS --max_gaussians $MAX_GAUSSIANS"
+FLAGS="$FLAGS --test_every $TEST_EVERY"
 
 
 FLAGS="$FLAGS --save_steps $SAVE_STEPS"
