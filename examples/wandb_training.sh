@@ -71,6 +71,7 @@ if [ $# -lt 2 ]; then
     echo "  --depth_ground            Enable Packed Mode"
     echo "  --depth_model {da3metric-large, da3mono-large}            Enable Packed Mode"
     echo "  --strategy_depth        Strategy "
+    echo "  --difix                  Enable Difix3D distillation (uses simple_trainer_difix_wandb.py)"
 
     exit 1
 fi
@@ -104,6 +105,8 @@ DEPTH_GROUND=false
 DEPTH_MODEL="DA3MONO-LARGE"
 STRATEGY_DEPTH="progressive"
 SSIM_LAMBDA=0.2
+DIFIX=false
+CKPT_PATH=""
 MAX_GAUSSIANS=1000000
 TEST_EVERY=0
 
@@ -160,6 +163,14 @@ while [[ $# -gt 0 ]]; do
         --depth-ground)
             DEPTH_GROUND=true
             shift
+            ;;
+        --difix)
+            DIFIX=true
+            shift
+            ;;
+        --ckpt)
+            CKPT_PATH=$2
+            shift 2
             ;;
         --post-processing)
             case $2 in
@@ -247,6 +258,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# When Difix distillation is enabled we are finetuning our pretrained 80k
+# MCMC+antialiased+app_opt checkpoints. Default those features on so the
+# model architecture matches the ckpt even if the caller forgot the flags.
+if [ "$DIFIX" = true ]; then
+    ANTIALIASED=true
+    APP_OPT=true
+fi
+
 FEATURES=()
 
 ## ADD FEATURES TO ADD TO THE NAME OF THE FOLDER
@@ -268,6 +287,10 @@ fi
 
 if [ "$BILATERAL" = true ]; then
     FEATURES+=("bilateral")
+fi
+
+if [ "$DIFIX" = true ]; then
+    FEATURES+=("difix")
 fi
 
 if [ "$DEPTH_LOSS" = true ]; then
@@ -430,7 +453,12 @@ FLAGS="$FLAGS --save_steps $SAVE_STEPS"
 
 # Add conditional flags
 if [ "$ABSGRAD" = true ]; then
-    FLAGS="$FLAGS --strategy.absgrad --absgrad --strategy.grow_grad2d $GROW_GRAD2D"
+    FLAGS="$FLAGS --absgrad"
+    # --strategy.absgrad and --strategy.grow_grad2d only exist on DefaultStrategy,
+    # not MCMCStrategy. Only pass them for the 'classic' (default) densification.
+    if [ "$DENSIFICATION" = "classic" ]; then
+        FLAGS="$FLAGS --strategy.absgrad --strategy.grow_grad2d $GROW_GRAD2D"
+    fi
 fi
 
 if [ "$ANTIALIASED" = true ]; then
@@ -452,6 +480,10 @@ fi
 
 if [ "$PPISP" = true ]; then
     FLAGS="$FLAGS --post_processing ppisp"
+fi
+
+if [ -n "$CKPT_PATH" ]; then
+    FLAGS="$FLAGS --ckpt $CKPT_PATH"
 fi
 
 
@@ -483,7 +515,14 @@ START_TIME=$(date +%s)
 # Training with MEMORY OPTIMIZATIONS
 # -------------------------
 
-srun python /home/hensemberk/dev/Soccernet/gsplat/examples/simple_trainer_wandb.py "$DENSIFICATION_CMD" \
+if [ "$DIFIX" = true ]; then
+    TRAINER_SCRIPT="/home/fabian/gsplat_soccernet/examples/simple_trainer_difix_wandb.py"
+    FLAGS="$FLAGS --use_difix"
+else
+    TRAINER_SCRIPT="/home/fabian/gsplat_soccernet/examples/simple_trainer_wandb.py"
+fi
+
+srun python "$TRAINER_SCRIPT" "$DENSIFICATION_CMD" \
     --max_steps $MAX_STEPS \
     --data_dir $DATA_DIR \
     --result_dir $RESULT_DIR \
@@ -518,7 +557,7 @@ print_header "TRAINING COMPLETED"
 print_info "Duration: $((DURATION / 60)) minutes ($DURATION seconds)"
 
 CKPT="$RESULT_DIR/ckpts/ckpt_$((MAX_STEPS-1))_rank0.pt"
-REPO_ROOT="/home/hensemberk/dev/Soccernet/gsplat"
+REPO_ROOT="/home/fabian/gsplat_soccernet"
 
 
 
