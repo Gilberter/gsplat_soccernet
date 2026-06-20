@@ -35,6 +35,8 @@ from .normalize import (
     transform_points,
 )
 
+from collections import defaultdict
+
 
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
@@ -456,17 +458,89 @@ class Dataset:
             self.mini_depths= torch.zeros((C,H,W), dtype=torch.float32)
             self.mini_confidences = torch.zeros((C,H,W), dtype=torch.float32)
 
-        indices = np.arange(len(self.parser.image_names))
-        if self.parser.test_every == 0:
-            print(f"All Training")
-            self.indices = indices
-        elif split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
-            #self.indices = indices[list(range(self.parser.test_every,len(self.parser.image_names)))]
+        # indices = np.arange(len(self.parser.image_names))
+        # if self.parser.test_every == 0:
+        #     print(f"All Training")
+        #     self.indices = indices
+        # elif split == "train":
+        #     self.indices = indices[indices % self.parser.test_every != 0]
+        #     #self.indices = indices[list(range(self.parser.test_every,len(self.parser.image_names)))]
+        # elif split == "val":
+        #     self.indices = indices[indices % self.parser.test_every == 0]
+        #     #self.indices = indices[list(range(self.parser.test_every))]
+
+        txt_path = "/home/hensemberk/dev/Soccernet/gsplat/examples/datasets/near_indices.txt"
+        scene = os.path.basename(self.parser.data_dir)
+        total_indices = np.arange(len(self.parser.image_names))
+
+        near_images = []
+
+        with open(txt_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if f"/{scene}/" in line:
+                    img_name = os.path.basename(line)
+                    near_images.append(img_name)
+
+        near_images = np.array(near_images)
+        print(f"Images found in .txt for this scene: {len(near_images)}")
+
+        # ---- split near images ----
+        np.random.seed(42)
+        perm = np.random.permutation(len(near_images))
+
+        half = len(near_images) // 2
+        val_near = set(near_images[perm[:half]])
+        train_near = set(near_images[perm[half:]])
+
+        # ---- map to indices ----
+        val_indices = []
+        train_indices = []
+
+        for idx, path in enumerate(self.parser.image_names):
+            img_name = os.path.basename(path)
+
+            if img_name in val_near:
+                val_indices.append(idx)
+            elif img_name in train_near:
+                train_indices.append(idx)
+
+        # ---- COMPLETE validation to 85 using total_indices ----
+        TARGET_VAL = 85
+
+        val_indices = set(val_indices)
+
+        # all remaining candidates (not already in val)
+        remaining = list(set(total_indices) - val_indices)
+
+        np.random.seed(42)
+        extra_needed = TARGET_VAL - len(val_indices)
+
+        if extra_needed > 0:
+            extra = np.random.choice(remaining, size=extra_needed, replace=False)
+            val_indices.update(extra)
+
+        # ---- final train = everything else ----
+        train_indices = list(set(total_indices) - val_indices)
+
+        # convert to numpy
+        train_indices = np.array(sorted(train_indices))
+        val_indices = np.array(sorted(val_indices))
+
+        if len(near_images) > 0:
+            sample_img = near_images[0]
+            in_val = any(os.path.basename(self.parser.image_names[i]) == sample_img for i in val_indices)
+            in_train = any(os.path.basename(self.parser.image_names[i]) == sample_img for i in train_indices)
+            print(f"Sample 'near' image ({sample_img}) distributed: {'Yes' if in_val or in_train else 'No'}")
+
+        # ---- assign ----
+        if split == "train":
+            self.indices = train_indices
         elif split == "val":
-            self.indices = indices[indices % self.parser.test_every == 0]
-            #self.indices = indices[list(range(self.parser.test_every))]
-            
+            self.indices = val_indices
 
     def __len__(self):
         return len(self.indices)
@@ -574,7 +648,7 @@ class Dataset:
                 ground_mask = torch.zeros(h, w, dtype=torch.bool)
 
             data["ground_mask"] = ground_mask  # [H, W] bool
-        if self.load_mini_npz != "":
+        if self.load_mini_npz != "" and self.load_depths == True:
             mini_d = torch.from_numpy(self.mini_depths[index]).float()
             img_h, img_w = image.shape[:2]
              # Resize if the npz resolution doesn't match the current image

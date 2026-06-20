@@ -1,3 +1,96 @@
+
+
+# 🏆 CVAIL – HandsOn Computer Vision for SoccerNet 2026 Novel View Synthesis Challenge
+
+> **The CVAIL - HandsOn Computer Vision approach for SoccerNet 2026 Novel View Synthesis (NVS), based on CUDA-accelerated Rasterization of 3D Gaussian Splatting (3DGS).**
+
+> 🔗 CVAIL Research: https://github.com/cvail-research
+
+> 🔗 Hands-on Computer Vision: https://github.com/cvail-research/Hands-on-Computer-Vision
+
+
+## 📖 Overview
+
+Our method extends the **gsplat 3D Gaussian Splatting** framework with:
+
+* Depth-guided geometric reconstruction using **Depth Anything V3**
+* Improved appearance compensation for challenging viewpoints
+* Semantic ensemble of **3DGS** and **Triangle Splatting**
+* Color correction through **MVGD statistics transfer**
+
+The pipeline is designed to improve rendering quality under extreme novel viewpoints while maintaining real-time rasterization performance.
+
+---
+
+## 📊 Results
+
+Our method was evaluated on a synthetic validation set consisting of five scenes and compared against the official **gsplat** baseline. While the baseline achieves the best performance on Scene 1, our approach consistently improves rendering quality across the remaining scenes, leading to higher average PSNR and SSIM scores.
+
+| Scene       | gsplat PSNR ↑ | gsplat SSIM ↑ | Ours PSNR ↑ | Ours SSIM ↑ |
+| ----------- | ------------- | ------------- | ----------- | ----------- |
+| Scene 1     | **30.7053**   | **0.8229**    | 29.8623     | 0.8146      |
+| Scene 2     | 28.2402       | 0.8043        | **30.1390** | **0.8414**  |
+| Scene 3     | 26.5945       | 0.7814        | **29.1802** | **0.8417**  |
+| Scene 4     | 28.5718       | 0.8130        | **28.6485** | **0.8246**  |
+| Scene 5     | 28.6487       | 0.7864        | **29.0613** | **0.8010**  |
+| **Average** | **28.5521**   | **0.8016**    | **29.3783** | **0.8247**  |
+
+### Summary
+
+* Average PSNR improved from **28.55 dB** to **29.38 dB** (**+0.83 dB**).
+* Average SSIM increased from **0.8016** to **0.8247** (**+0.0231**).
+* Best performance achieved in **4 out of 5 scenes**.
+* Largest gain observed in **Scene 3**, with a **+2.59 dB PSNR** improvement over the baseline.
+* Results demonstrate that the proposed depth-guided reconstruction, semantic ensemble, and color correction pipeline provide more accurate and visually consistent novel-view renderings.
+
+---
+
+## 📄 Technical Report
+
+For detailed methodology, experiments, and implementation details:
+
+**Technical Report (PDF):**
+
+[📄 SoccerNet Technical Report](assets/Soccernet_Technical_Report_2026.pdf)
+
+---
+
+## 🔗 Challenge Results & Official Resources
+
+The official SoccerNet Novel View Synthesis Challenge page includes the final leaderboard, winning teams, challenge results, and links to the corresponding CVPR 2026 workshop papers.
+
+**Official SoccerNet Challenge Resources**
+
+https://drive.google.com/drive/folders/1x21bgkszAJueMTezZWc_BmTjqZyg2xor
+
+---
+
+## 🖼️ Qualitative Results
+
+🏆 **Hands-On Computer Vision (CVAIL)** achieved **3rd Place** in the **SoccerNet 2026 Novel View Synthesis Challenge**, obtaining a final **PSNR of 25.540** on the official evaluation benchmark.
+
+<p align="center">
+  <a href="assets/SoccernetResults.png">
+    <img src="assets/SoccernetResults.png" width="100%">
+  </a>
+</p>
+
+<p align="center">
+<b>Official SoccerNet 2026 NVS Leaderboard — CVAIL / Hands-On Computer Vision (3rd Place, PSNR 25.540)</b>
+</p>
+
+---
+
+## 👥 Team CVAIL
+
+* Fabian Perez
+* Juan Vanegas
+* Christian Orduz
+* Hoover Rueda-Chacon
+
+Universidad Industrial de Santander (UIS), Colombia
+
+
 # gsplat
 
 [![Core Tests.](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml/badge.svg?branch=main)](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml)

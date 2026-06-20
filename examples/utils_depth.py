@@ -431,9 +431,14 @@ class ScaleAndShiftInvariantLossLight(nn.Module):
         self.prediction_ssi = scale.view(-1, 1, 1) * prediction + shift.view(-1, 1, 1)
         
         # Data loss (primary)
+
+
+        # esto es dentro de scale and shift invariant loss
+        # DEPTH LOSS
         loss = self.data_loss(self.prediction_ssi, target, mask)
         
-        # Light gradient loss (downsampled to reduce memory)
+        # Si se tiene un alpha mayor a zero se multiplica el grad_loss por el alpha
+        
         if self.alpha > 0:
             # Downsample by factor of 2 to reduce memory
             step = 2

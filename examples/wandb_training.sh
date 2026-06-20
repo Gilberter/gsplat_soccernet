@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=soccernet_nvs
 #SBATCH --output=./logs/colmap_rendering_%j.out
-#SBATCH --account=soccernet_nvs
+#SBATCH --account=gs_hyperspectral
 #SBATCH --error=./logs/error_rendering_%j.log 
 #SBATCH --cpus-per-task=10
 #SBATCH --partition=gpu 
@@ -13,7 +13,7 @@ echo "Running on node: $SLURM_NODELIST"
 echo "Working directory: $(pwd)"
 
 source /opt/miniforge3/etc/profile.d/conda.sh
-conda activate soccernet
+conda activate soccernet_opacity
 
 export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
 export CUDA_LAUNCH_BLOCKING=1
@@ -519,7 +519,7 @@ if [ "$DIFIX" = true ]; then
     TRAINER_SCRIPT="/home/fabian/gsplat_soccernet/examples/simple_trainer_difix_wandb.py"
     FLAGS="$FLAGS --use_difix"
 else
-    TRAINER_SCRIPT="/home/fabian/gsplat_soccernet/examples/simple_trainer_wandb.py"
+    TRAINER_SCRIPT="/home/hensemberk/dev/Soccernet/gsplat/examples/simple_trainer_wandb.py"
 fi
 
 srun python "$TRAINER_SCRIPT" "$DENSIFICATION_CMD" \

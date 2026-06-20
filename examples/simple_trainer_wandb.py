@@ -451,6 +451,7 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         if len(self.valset) == 0:
            print(f"No Test Set")
+        print(len(self.valset))
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -1012,7 +1013,9 @@ class Runner:
 
                     if torch.isfinite(depthloss_ssil) and depthloss_ssil.item() > 0:
                         
-                        depthloss_ssil = torch.clamp(depthloss_ssil, max=10.0) * lambda_base
+                        # depthloss_ssil viene directamente de ssi_loss_fn
+                        # depthloss_ssil = depth_loss + alpha*loss_grad
+                        depthloss_ssil = torch.clamp(depthloss_ssil, max=10.0) * lambda_base # se multiplica todo por depth_lambda
                         depthloss_total = depthloss_total + depthloss_ssil
                         if step % 500 == 0:
                             print(f"[Step {step}] SSIL depth loss: {depthloss_ssil.item():.6f}")
@@ -1333,7 +1336,8 @@ class Runner:
 
             if step % cfg.wandb_steps == 0:
                 self.eval_challenge(step)
-                #self.eval(step)
+            if step % 1000 == 0 and cfg.use_wandb:
+                self.eval(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1394,6 +1398,12 @@ class Runner:
             wandb_log_dict = {}
             timings = []
 
+            wandb_log_dict[f"{stage}/challenge_rgb"] = []
+            wandb_log_dict[f"{stage}/challenge_depth"] = []
+
+            rgb_tensors = []
+            depth_tensors = []
+
             # Render selected challenge views
             for idx in indices:
                 c2w = torch.from_numpy(c2w_mats[idx]).float().to(device)
@@ -1401,7 +1411,6 @@ class Runner:
                 width, height = imsize_list[idx]
                 image_id = image_ids[idx]
 
-                torch.cuda.synchronize()
                 tic = time.time()
 
                 # Render challenge view (RGB + Expected Depth)
@@ -1416,17 +1425,15 @@ class Runner:
                     render_mode="RGB+ED",
                 )  # [1, H, W, 4]
 
-                torch.cuda.synchronize()
                 render_time = time.time() - tic
-                timings.append(render_time)
 
-                # Extract RGB and Depth
-                rgb = render_out[0, ..., :3]  # [H, W, 3]
-                depth = render_out[0, ..., 3]  # [H, W]
-                rgb = torch.clamp(rgb, 0.0, 1.0)
+
+                rgb = torch.clamp(render_out[0, ..., :3], 0.0, 1.0).contiguous()
+                depth = render_out[0, ..., 3].contiguous()
 
                 # Convert to uint8 for display
-                rgb_uint8 = (rgb.cpu().numpy() * 255).astype(np.uint8)
+                rgb = (rgb * 255).to(torch.uint8).contiguous()
+                rgb_cpu = rgb.cpu()   # ← NO non_blocking
 
                 # Visualize depth
                 d_min, d_max = depth.min(), depth.max()
@@ -1434,37 +1441,50 @@ class Runner:
                     depth_viz = (depth - d_min) / (d_max - d_min + 1e-5)
                 else:
                     depth_viz = torch.zeros_like(depth)
-                depth_viz_uint8 = (depth_viz.cpu().numpy() * 255).astype(np.uint8)
+                
+                depth_viz = (depth_viz * 255).to(torch.uint8).contiguous()
+                depth_cpu = depth_viz.cpu()
 
-                # Log to W&B
-                challenge_rgb_img = wandb.Image(
-                    rgb_uint8, caption=f"{stage}_view{idx}_rgb (id:{image_id})"
+                rgb_tensors.append((idx, image_id, rgb_cpu))
+                depth_tensors.append((idx, depth_cpu))
+
+            wandb_rgb = []
+            wandb_depth = []
+
+            # RGB images
+            for idx, image_id, img in rgb_tensors:
+                img = img.contiguous()
+
+                if img.device.type != "cpu":
+                    img = img.cpu()
+
+                img_np = img.numpy()
+
+                wandb_rgb.append(
+                    wandb.Image(img_np, caption=f"step{step}_view{idx}_id{image_id}")
                 )
-                challenge_depth_img = wandb.Image(
-                    depth_viz_uint8, caption=f"{stage}_view{idx}_depth"
+                print(f"Added Wandb")
+
+            # Depth images
+            for idx, img in depth_tensors:
+                img = img.contiguous()
+
+                if img.device.type != "cpu":
+                    img = img.cpu()
+
+                img_np = img.numpy()
+                
+                wandb_depth.append(
+                    wandb.Image(img_np, caption=f"step{step}_view{idx}")
                 )
+                
 
-                wandb_log_dict[f"{stage}_rgb_view{idx}"] = challenge_rgb_img
-                wandb_log_dict[f"{stage}_depth_view{idx}"] = challenge_depth_img
+            wandb_log_dict = {
+                f"{stage}/challenge_rgb": wandb_rgb,
+                f"{stage}/challenge_depth": wandb_depth,
+            }
 
-                print(
-                    f"   ✓ View {idx} (image_id={image_id}): "
-                    f"RGB{rgb_uint8.shape} | time={render_time:.3f}s"
-                )
-
-            # Log summary stats
-            avg_time = np.mean(timings)
-            wandb_log_dict[f"{stage}/avg_render_time_per_view"] = avg_time
-            wandb_log_dict[f"{stage}/num_GS"] = len(self.splats["means"])
-            wandb_log_dict[f"{stage}/num_views_rendered"] = len(indices)
-
-            # Send to W&B
             wandb.log(wandb_log_dict, step=step)
-
-            print(f"✅ Challenge evaluation complete:")
-            print(f"   Views rendered: {len(indices)}")
-            print(f"   Avg time/view: {avg_time:.3f}s")
-            print(f"   Gaussians: {len(self.splats['means']):,}")
 
         except Exception as e:
             print(f"❌ Challenge evaluation failed: {e}")
@@ -1487,7 +1507,8 @@ class Runner:
         ellipse_time = 0
         metrics = defaultdict(list)
 
-                # Initialize wandb if enable
+        # Initialize wandb if enable
+                
 
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
@@ -1499,7 +1520,6 @@ class Runner:
             # Exposure metadata is available for any image with EXIF data (train or val)
             exposure = data["exposure"].to(device) if "exposure" in data else None
 
-            torch.cuda.synchronize()
             tic = time.time()
             colors, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -1514,113 +1534,57 @@ class Runner:
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )  # [1, H, W, 3]
-            torch.cuda.synchronize()
+         
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
 
-            if world_rank == 0:
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
+            
+            
+            pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
+            colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+            metrics["psnr"].append(self.psnr(colors_p, pixels_p))
+            metrics["ssim"].append(self.ssim(colors_p, pixels_p))
+            metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+   
+       
+        ellipse_time /= len(valloader)
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
-                # Compute color-corrected metrics for fair comparison across methods
-                if cfg.use_color_correction_metric:
-                    if cfg.color_correct_method == "affine":
-                        cc_colors = color_correct_affine(colors, pixels)
-                    else:
-                        cc_colors = color_correct_quadratic(colors, pixels)
-                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
-                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
-                    metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
-
-        if world_rank == 0:
-            ellipse_time /= len(valloader)
-
-            stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
-            stats.update(
-                {
-                    "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["means"]),
-                }
+        stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
+        stats.update(
+            {
+                "ellipse_time": ellipse_time,
+                "num_GS": len(self.splats["means"]),
+            }
+        )
+        if cfg.use_color_correction_metric:
+            print(
+                f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
+                f"Time: {stats['ellipse_time']:.3f}s/image "
+                f"Number of GS: {stats['num_GS']}"
             )
-            if cfg.use_color_correction_metric:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            else:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            # save stats as json
-            with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
-                json.dump(stats, f)
-            # save stats to tensorboard
-            for k, v in stats.items():
-                self.writer.add_scalar(f"{stage}/{k}", v, step)
-            self.writer.flush()
+        else:
+            print(
+                f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                f"Time: {stats['ellipse_time']:.3f}s/image "
+                f"Number of GS: {stats['num_GS']}"
+            )
+        # save stats as json
+        with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
+            json.dump(stats, f)
+        # save stats to tensorboard
+        for k, v in stats.items():
+            self.writer.add_scalar(f"{stage}/{k}", v, step)
+        self.writer.flush()
 
-            if cfg.use_wandb:
-                
-                formatted_stats = {k: float(v) if torch.is_tensor(v) else v for k, v in stats.items()}
+        if cfg.use_wandb:
+            
+            formatted_stats = {k: float(v) if torch.is_tensor(v) else v for k, v in stats.items()}
 
-                if len(metrics["psnr"]) > 0:
-                    c2w_mats, ks_list, imsize_list, image_ids = load_challenges(cfg.wandb_path_challenge,factor=cfg.data_factor)
-                    c2w = torch.from_numpy(np.array(c2w_mats)).float().to(device)
-                    Ks   = torch.from_numpy(np.array(ks_list)).float().to(device)
-                    # viewmat = c2w[38].inverse().unsqueeze(0)  # [1, 4, 4]
-                    K_batch = Ks[38].unsqueeze(0)              # [1, 3, 3]
-                    #print(f"CWS {c2w.shape} and KS {Ks.shape}")
-                    render_nv, _, _ = self.rasterize_splats(
-                        camtoworlds=c2w[38].unsqueeze(0) ,
-                        Ks=Ks[38].unsqueeze(0) ,
-                        width=width,
-                        height=height,
-                        sh_degree=cfg.sh_degree,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                        render_mode="RGB+ED",
-                    )  # [1, H, W, 4]
-
-
-
-                    rgb_part = render_nv[0, ..., :3]
-                    depth_part = render_nv[0, ..., 3]
-
-                    d_min, d_max = depth_part.min(), depth_part.max()
-                    depth_viz = (depth_part - d_min) / (d_max - d_min + 1e-5)
-                    depth_viz = (depth_viz.cpu().numpy() * 255).astype(np.uint8)
-                    
-                    rgb_nv_wandb = (torch.clamp(rgb_part, 0, 1).cpu().numpy() * 255).astype(np.uint8)
-
-                    example_image = wandb.Image(canvas, caption=f"{stage}_example_render")
-                    challenge_rgb = wandb.Image(rgb_nv_wandb, caption=f"{stage}_challenge_rgb")
-                    challenge_depth = wandb.Image(depth_viz, caption=f"{stage}_challenge_depth")
-
-                    print(f"Logging to W&B: {rgb_nv_wandb.shape}, type: {rgb_nv_wandb.dtype}")
-                    print(f"Logging to W&B: {depth_viz.shape}, type: {depth_viz.dtype}")
-                    wandb.log({
-                        **formatted_stats,
-                        f"{stage}_example_render": example_image,
-                        f"{stage}_challenge_rgb": challenge_rgb,
-                        f"{stage}_challenge_depth": challenge_depth
-                    }, step=step)
+            wandb.log({
+                **formatted_stats
+            }, step=step)
 
     @torch.no_grad()
     def render_traj(self, step: int):

@@ -57,6 +57,14 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+from utils_eval_challenge import load_challenges,save_outputs,render_camera, load_splats, save_outputs_canvas, delete_image
+
+
+import wandb # wand import at top
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 @dataclass
 class Config:
@@ -236,6 +244,36 @@ class Config:
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
     with_eval3d: bool = False
+
+    rasterize_mode: Optional[Literal["classic", "antialiased"]] = None
+
+    strategy_depth: Literal["None","progressive","cosine_warmup","exponential"] = "progressive"
+    depth_loss_to_compute: List[Literal["SSIL", "MSS"]] = field(default_factory=lambda: ["SSIL"])
+
+    absgrad: bool = False
+
+    mini_depth_dir: str = ""
+
+    feature_dim: int = 32
+
+    max_refine_steps: int = 25000
+
+    noise_lr:float = 5e4 # default 5e5
+
+    min_opacity:float = 0.01 # Default 0.005
+
+    max_gaussians:int= 1_000_000
+
+    colmap_dir: str = ""
+
+
+    use_wandb: bool = True
+    wandb_project: str = "gsplat"
+    wandb_entity: str = "higilberter-universidad-industrial-de-santander"
+    wandb_run_name: Optional[str] = None
+    wandb_key = os.getenv('WANDB_API_KEY')
+    wandb_steps: int = 1000
+    wandb_path_challenge:str = ""
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -419,19 +457,19 @@ class Runner:
                 )
         else:
             self.parser = Parser(
-                data_dir=cfg.data_dir,
-                factor=cfg.data_factor,
-                normalize=cfg.normalize_world_space,
-                test_every=cfg.test_every,
-                load_exposure=cfg.load_exposure,
+            data_dir=cfg.data_dir,
+            factor=cfg.data_factor,
+            normalize=cfg.normalize_world_space,
+            test_every=cfg.test_every,
+            load_exposure=cfg.load_exposure,
+            colmap_dir=cfg.colmap_dir
             )
+
             self.trainset = Dataset(
                 self.parser,
-                split="train",
-                patch_size=cfg.patch_size,
-                load_depths=cfg.depth_loss,
+                split="train"
             )
-            self.valset = Dataset(self.parser, split="val")
+        self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -772,6 +810,20 @@ class Runner:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
 
+
+        if cfg.use_wandb:
+            wandb.init(
+                project=cfg.wandb_project,
+                entity=cfg.wandb_entity,
+                name=cfg.wandb_run_name or f"{cfg.result_dir}",
+                config=vars(cfg),
+                dir=cfg.result_dir,
+                reinit="finish_previous",
+                mode="online",
+            )
+            print(f"Wandb initialized: {wandb.run.name}")
+            print(f"Wandb URL: {wandb.run.url}")   # prints the direct link to the run
+
         max_steps = cfg.max_steps
         init_step = 0
 
@@ -1000,6 +1052,28 @@ class Runner:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
+                
+                opacities = torch.sigmoid(self.splats["opacities"].flatten())
+
+                if cfg.use_wandb:
+                    wandb.log({
+                        "gaussian/opacity_min": opacities.min().item(),
+                        "gaussian/opacity_max": opacities.max().item(),
+                        "gaussian/opacity_mean": opacities.mean().item(),
+                        "gaussian/num_gaussians": len(self.splats["means"]),
+                        "gaussian/collapsed_count opacities < 0.01": (opacities < 0.01).sum().item(),
+                        
+                    }, step=step)
+                
+                if cfg.use_wandb:
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/l1loss": l1loss.item(),
+                        "train/ssimloss": ssimloss.item(),
+                        "train/num_GS": len(self.splats["means"]),
+                        "train/mean_lambda": schedulers[0].get_last_lr()[0]
+                    }, step=step)
+
                 self.writer.flush()
 
             # save checkpoint before updating the model
@@ -1133,10 +1207,15 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
-            # eval the full set
-            if step in [i - 1 for i in cfg.eval_steps]:
+            # # eval the full set
+            # if step in [i - 1 for i in cfg.eval_steps]:
+            #     self.eval(step)
+            #     self.render_traj(step)
+
+            if step % cfg.wandb_steps == 0:
+                self.eval_challenge(step)
+            if step % 1000 == 0 and cfg.use_wandb:
                 self.eval(step)
-                self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1155,6 +1234,141 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
+        if cfg.use_wandb:
+            # ✅ Finish the run
+            wandb.finish()
+            print(f"✅ Wandb run finished")
+  
+    @torch.no_grad()
+    def eval_challenge(self, step: int, stage: str = "challenge"):
+        """
+        Evaluate and log ONLY 3 challenge novel views to W&B.
+        No metrics computed (no ground truth available).
+        Focus: render and visualize challenge camera poses.
+        """
+        print("🎯 Running challenge-only evaluation (3 views)...")
+        cfg = self.cfg
+        device = self.device
+        world_rank = self.world_rank
+
+        if world_rank != 0:
+            return  # Only master process logs to W&B
+
+        try:
+            # Load challenge cameras
+            c2w_mats, ks_list, imsize_list, image_ids = load_challenges(
+                cfg.wandb_path_challenge, factor=cfg.data_factor
+            )
+            num_views = len(c2w_mats)
+            print(f"   Loaded {num_views} challenge views")
+
+            # Select 3 evenly spaced views
+            if num_views >= 3:
+                indices = [0, num_views // 2, num_views - 1]
+            elif num_views == 2:
+                indices = [0, 1]
+            else:
+                indices = [0]
+
+            print(f"   Rendering views at indices: {indices}")
+
+            wandb_log_dict = {}
+            timings = []
+
+            wandb_log_dict[f"{stage}/challenge_rgb"] = []
+            wandb_log_dict[f"{stage}/challenge_depth"] = []
+
+            rgb_tensors = []
+            depth_tensors = []
+
+            # Render selected challenge views
+            for idx in indices:
+                c2w = torch.from_numpy(c2w_mats[idx]).float().to(device)
+                K = torch.from_numpy(ks_list[idx]).float().to(device)
+                width, height = imsize_list[idx]
+                image_id = image_ids[idx]
+
+                tic = time.time()
+
+                # Render challenge view (RGB + Expected Depth)
+                render_out, _, _ = self.rasterize_splats(
+                    camtoworlds=c2w.unsqueeze(0),
+                    Ks=K.unsqueeze(0),
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+ED",
+                )  # [1, H, W, 4]
+
+                render_time = time.time() - tic
+
+
+                rgb = torch.clamp(render_out[0, ..., :3], 0.0, 1.0).contiguous()
+                depth = render_out[0, ..., 3].contiguous()
+
+                # Convert to uint8 for display
+                rgb = (rgb * 255).to(torch.uint8).contiguous()
+                rgb_cpu = rgb.cpu()   # ← NO non_blocking
+
+                # Visualize depth
+                d_min, d_max = depth.min(), depth.max()
+                if d_max > d_min:
+                    depth_viz = (depth - d_min) / (d_max - d_min + 1e-5)
+                else:
+                    depth_viz = torch.zeros_like(depth)
+                
+                depth_viz = (depth_viz * 255).to(torch.uint8).contiguous()
+                depth_cpu = depth_viz.cpu()
+
+                rgb_tensors.append((idx, image_id, rgb_cpu))
+                depth_tensors.append((idx, depth_cpu))
+
+            wandb_rgb = []
+            wandb_depth = []
+
+            # RGB images
+            for idx, image_id, img in rgb_tensors:
+                img = img.contiguous()
+
+                if img.device.type != "cpu":
+                    img = img.cpu()
+
+                img_np = img.numpy()
+
+                wandb_rgb.append(
+                    wandb.Image(img_np, caption=f"step{step}_view{idx}_id{image_id}")
+                )
+                print(f"Added Wandb")
+
+            # Depth images
+            for idx, img in depth_tensors:
+                img = img.contiguous()
+
+                if img.device.type != "cpu":
+                    img = img.cpu()
+
+                img_np = img.numpy()
+                
+                wandb_depth.append(
+                    wandb.Image(img_np, caption=f"step{step}_view{idx}")
+                )
+                
+
+            wandb_log_dict = {
+                f"{stage}/challenge_rgb": wandb_rgb,
+                f"{stage}/challenge_depth": wandb_depth,
+            }
+
+            wandb.log(wandb_log_dict, step=step)
+
+        except Exception as e:
+            print(f"❌ Challenge evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
@@ -1169,6 +1383,10 @@ class Runner:
         )
         ellipse_time = 0
         metrics = defaultdict(list)
+
+        # Initialize wandb if enable
+                
+
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -1179,7 +1397,6 @@ class Runner:
             # Exposure metadata is available for any image with EXIF data (train or val)
             exposure = data["exposure"].to(device) if "exposure" in data else None
 
-            torch.cuda.synchronize()
             tic = time.time()
             colors, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -1194,67 +1411,58 @@ class Runner:
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )  # [1, H, W, 3]
-            torch.cuda.synchronize()
+         
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
 
-            if world_rank == 0:
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
+            
+            
+            pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
+            colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+            metrics["psnr"].append(self.psnr(colors_p, pixels_p))
+            metrics["ssim"].append(self.ssim(colors_p, pixels_p))
+            metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+   
+       
+        ellipse_time /= len(valloader)
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
-                # Compute color-corrected metrics for fair comparison across methods
-                if cfg.use_color_correction_metric:
-                    if cfg.color_correct_method == "affine":
-                        cc_colors = color_correct_affine(colors, pixels)
-                    else:
-                        cc_colors = color_correct_quadratic(colors, pixels)
-                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
-                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
-                    metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
-
-        if world_rank == 0:
-            ellipse_time /= len(valloader)
-
-            stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
-            stats.update(
-                {
-                    "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["means"]),
-                }
+        stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
+        stats.update(
+            {
+                "ellipse_time": ellipse_time,
+                "num_GS": len(self.splats["means"]),
+            }
+        )
+        if cfg.use_color_correction_metric:
+            print(
+                f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
+                f"Time: {stats['ellipse_time']:.3f}s/image "
+                f"Number of GS: {stats['num_GS']}"
             )
-            if cfg.use_color_correction_metric:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            else:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            # save stats as json
-            with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
-                json.dump(stats, f)
-            # save stats to tensorboard
-            for k, v in stats.items():
-                self.writer.add_scalar(f"{stage}/{k}", v, step)
-            self.writer.flush()
+        else:
+            print(
+                f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                f"Time: {stats['ellipse_time']:.3f}s/image "
+                f"Number of GS: {stats['num_GS']}"
+            )
+        # save stats as json
+        with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
+            json.dump(stats, f)
+        # save stats to tensorboard
+        for k, v in stats.items():
+            self.writer.add_scalar(f"{stage}/{k}", v, step)
+        self.writer.flush()
+
+        if cfg.use_wandb:
+            
+            formatted_stats = {k: float(v) if torch.is_tensor(v) else v for k, v in stats.items()}
+
+            wandb.log({
+                **formatted_stats
+            }, step=step)
+
 
     @torch.no_grad()
     def render_traj(self, step: int):
